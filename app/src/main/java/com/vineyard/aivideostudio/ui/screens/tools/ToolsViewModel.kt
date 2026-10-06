@@ -93,7 +93,7 @@ data class AudioCueUiModel(
 )
 
 /**
- * Represents the real-time status of one of the 5 concurrent IDM worker streams.
+ * Represents the real-time status of one of the 10 concurrent IDM worker streams.
  */
 data class ExtractionWorkerTask(
     val taskId: Int,
@@ -123,7 +123,7 @@ data class ToolsUiState(
     val progressPercent: Int = 0,
     val isProcessing: Boolean = false,
 
-    // IDM Multi-Stream Parallel Worker Tasks (5 streams)
+    // IDM Multi-Stream Parallel Worker Tasks (10 streams)
     val workerTasks: List<ExtractionWorkerTask> = emptyList(),
 
     // Target Panel Rules & Clusters (Tab 1)
@@ -321,13 +321,13 @@ class ToolsViewModel(
             statusText = "Extracting...", 
             statusColorHex = "#eab308"
         ) }
-        addLog("⚡ Starting IDM-style 5-stream parallel hardware frame extraction at $targetFps FPS...", LogType.INFO)
+        addLog("⚡ Starting IDM-style 10-stream parallel hardware frame extraction (10 frames/batch) at $targetFps FPS...", LogType.INFO)
         startBackgroundKeepAlive("Extracting video frames in background...")
 
         extractionJob?.cancel()
         extractionJob = viewModelScope.launch(Dispatchers.Default) {
             try {
-                // Initialize the 5 worker task slots in state
+                // Initialize the 10 worker task slots in state
                 val extractedList = frameExtractor.extractFramesWithWorkers(
                     videoUri = uri,
                     targetFps = targetFps,
@@ -377,7 +377,7 @@ class ToolsViewModel(
                         progressPercent = 0,
                         workerTasks = emptyList()
                     )}
-                    addLog("✅ Successfully extracted ${extractedList.size} frames via 5 concurrent worker streams.", LogType.SUCCESS)
+                    addLog("✅ Successfully extracted ${extractedList.size} frames via 10 concurrent worker streams.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
                 }
             } catch (e: Exception) {
