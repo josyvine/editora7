@@ -36,30 +36,39 @@ data class ExtractedFrame(
 )
 
 /**
+ * Metadata initialization parameters for one of the concurrent IDM worker tasks.
+ */
+data class WorkerInitInfo(
+    val taskId: Int,
+    val startFrame: Int,
+    val endFrame: Int,
+    val totalFrames: Int
+)
+
+/**
  * High-performance, multi-threaded native frame extraction engine.
  * Employs parallel hardware decoding workers and SIMD JPEG stream buffering
- * to match desktop-class extraction speeds (25–35+ FPS) without memory leaks.
+ * to match desktop-class extraction speeds without memory leaks.
  */
 class FastNativeFrameExtractor(private val context: Context) {
 
     /**
-     * Extracts frames at the given [targetFps], reporting progress via [onProgress].
-     * Parallelizes decoding across CPU cores on Dispatchers.IO.
+     * IDM-Style 5-Stream Parallel Extraction with per-worker real-time progress callbacks.
      */
-    suspend fun extractFrames(
+    suspend fun extractFramesWithWorkers(
         videoUri: Uri,
         targetFps: Int,
-        onProgress: (current: Int, total: Int) -> Unit
+        onInitWorkers: (List<WorkerInitInfo>) -> Unit,
+        onWorkerProgress: (taskId: Int, doneInWorker: Int, totalInWorker: Int) -> Unit,
+        onTotalProgress: (current: Int, total: Int) -> Unit
     ): List<ExtractedFrame> = withContext(Dispatchers.IO) {
 
-        // Use persistent filesDir so frames survive tab navigation and task switching
         val workspaceDir = File(context.filesDir, "editora_frames_workspace")
         if (workspaceDir.exists()) {
             workspaceDir.deleteRecursively()
         }
         workspaceDir.mkdirs()
 
-        // Probe duration, dimensions and rotation using an initial probe retriever
         val probeRetriever = MediaMetadataRetriever()
         val durationSec: Float
         val targetDecodeWidth: Int
@@ -104,32 +113,47 @@ class FastNativeFrameExtractor(private val context: Context) {
 
         val intervalUs = (1_000_000L / targetFps)
 
-        // IDM-style concurrent task segmentation: 5 concurrent workers
+        // IDM partition into 5 concurrent worker streams
         val workerCount = 5
         val chunkSize = ceil(totalFrames.toFloat() / workerCount.toFloat()).toInt()
+
+        val workerInitList = (0 until workerCount).map { i ->
+            val start = i * chunkSize
+            val end = min(totalFrames - 1, start + chunkSize - 1)
+            val framesInWorker = max(0, end - start + 1)
+            WorkerInitInfo(
+                taskId = i + 1,
+                startFrame = start,
+                endFrame = end,
+                totalFrames = framesInWorker
+            )
+        }
+
+        withContext(Dispatchers.Main) {
+            onInitWorkers(workerInitList)
+        }
 
         val completedCounter = AtomicInteger(0)
         val lastProgressDispatchTime = AtomicLong(0L)
 
-        val deferredWorkers = (0 until workerCount).map { workerIndex ->
-            val startIdx = workerIndex * chunkSize
-            val endIdx = min(totalFrames, startIdx + chunkSize)
-
+        val deferredWorkers = workerInitList.map { workerInfo ->
             async(Dispatchers.IO) {
-                if (startIdx >= endIdx) return@async emptyList<ExtractedFrame>()
+                if (workerInfo.totalFrames <= 0) return@async emptyList<ExtractedFrame>()
 
                 val workerFrames = mutableListOf<ExtractedFrame>()
                 val workerRetriever = MediaMetadataRetriever()
+                var workerDoneCount = 0
 
                 try {
                     workerRetriever.setDataSource(context, videoUri)
 
-                    // Process chunk in batches of 10 to maintain high throughput and reduce lock contention
+                    // Process chunk in mini-batches of 10
                     val batchSize = 10
-                    var currentBatchStart = startIdx
+                    var currentBatchStart = workerInfo.startFrame
+                    val workerEndBound = workerInfo.endFrame + 1
 
-                    while (currentBatchStart < endIdx && isActive) {
-                        val currentBatchEnd = min(endIdx, currentBatchStart + batchSize)
+                    while (currentBatchStart < workerEndBound && isActive) {
+                        val currentBatchEnd = min(workerEndBound, currentBatchStart + batchSize)
 
                         for (i in currentBatchStart until currentBatchEnd) {
                             if (!isActive) break
@@ -137,9 +161,14 @@ class FastNativeFrameExtractor(private val context: Context) {
                             val targetTimeUs = i * intervalUs
                             val timeSec = targetTimeUs / 1_000_000f
 
-                            // Hardware-scaled frame decoding
+                            // High-speed scaled hardware frame decoding
                             val frameBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && targetDecodeWidth > 0 && targetDecodeHeight > 0) {
                                 workerRetriever.getScaledFrameAtTime(
+                                    targetTimeUs,
+                                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                                    targetDecodeWidth,
+                                    targetDecodeHeight
+                                ) ?: workerRetriever.getScaledFrameAtTime(
                                     targetTimeUs,
                                     MediaMetadataRetriever.OPTION_CLOSEST,
                                     targetDecodeWidth,
@@ -165,7 +194,6 @@ class FastNativeFrameExtractor(private val context: Context) {
                                 writeErr.printStackTrace()
                             }
 
-                            // Immediately free decode bitmap memory
                             frameBitmap.recycle()
 
                             val timeFormatted = String.format(Locale.US, "%.2f", timeSec)
@@ -180,18 +208,24 @@ class FastNativeFrameExtractor(private val context: Context) {
                                 )
                             )
 
+                            workerDoneCount++
                             val completed = completedCounter.incrementAndGet()
                             val now = System.currentTimeMillis()
                             val lastTime = lastProgressDispatchTime.get()
 
-                            // Non-blocking throttled UI update
-                            if (now - lastTime > 60 || completed == totalFrames) {
+                            if (now - lastTime > 50 || completed == totalFrames) {
                                 if (lastProgressDispatchTime.compareAndSet(lastTime, now)) {
                                     withContext(Dispatchers.Main) {
-                                        onProgress(completed, totalFrames)
+                                        onWorkerProgress(workerInfo.taskId, workerDoneCount, workerInfo.totalFrames)
+                                        onTotalProgress(completed, totalFrames)
                                     }
                                 }
                             }
+                        }
+
+                        // Dispatch progress at end of each batch of 10
+                        withContext(Dispatchers.Main) {
+                            onWorkerProgress(workerInfo.taskId, workerDoneCount, workerInfo.totalFrames)
                         }
 
                         currentBatchStart = currentBatchEnd
@@ -206,16 +240,31 @@ class FastNativeFrameExtractor(private val context: Context) {
             }
         }
 
-        // Wait for all parallel extraction workers to finish
         val allChunks = deferredWorkers.awaitAll()
         val sortedFrames = allChunks.flatten().sortedBy { it.index }
 
-        // Final progress dispatch
         withContext(Dispatchers.Main) {
-            onProgress(sortedFrames.size, totalFrames)
+            onTotalProgress(sortedFrames.size, totalFrames)
         }
 
         return@withContext sortedFrames
+    }
+
+    /**
+     * Backward-compatible frame extraction interface.
+     */
+    suspend fun extractFrames(
+        videoUri: Uri,
+        targetFps: Int,
+        onProgress: (current: Int, total: Int) -> Unit
+    ): List<ExtractedFrame> {
+        return extractFramesWithWorkers(
+            videoUri = videoUri,
+            targetFps = targetFps,
+            onInitWorkers = {},
+            onWorkerProgress = { _, _, _ -> },
+            onTotalProgress = onProgress
+        )
     }
 
     /**
