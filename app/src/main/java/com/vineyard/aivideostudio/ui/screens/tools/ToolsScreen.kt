@@ -392,7 +392,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         }
     }
 
-    // 2. VIDEO UPLOAD & EXTRACTION CONTROLS + IDM CONCURRENT TASKS CONTAINER
+    // 2. VIDEO UPLOAD & EXTRACTION CONTROLS + IDM 10-STREAM PROGRESS CONTAINER
     Card(
         colors = CardDefaults.cardColors(containerColor = SurfaceDark),
         shape = RoundedCornerShape(10.dp),
@@ -448,7 +448,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                     }
                 }
 
-                // IDM-STYLE MULTI-STREAM PROGRESS BARS CONTAINER (UP TO 5 PARALLEL TASKS)
+                // IDM-STYLE MULTI-STREAM PROGRESS BARS CONTAINER (UP TO 10 PARALLEL TASKS)
                 if (state.isProcessing && state.workerTasks.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Column(
@@ -467,42 +467,50 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
-                                Text("IDM 5-Stream Parallel Extractor", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                Text("IDM 10-Stream Parallel Extractor (10 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                             }
                             Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         }
 
-                        // 5 Individual Worker Progress Bars
-                        state.workerTasks.forEach { task ->
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        text = "Task #${task.taskId} (Fr ${task.startFrame} - ${task.endFrame})",
-                                        color = Color(0xFF94A3B8),
-                                        fontSize = 10.sp,
-                                        fontFamily = FontFamily.Monospace
-                                    )
-                                    Text(
-                                        text = "${task.completedFrames}/${task.totalFrames} (${task.percent}%)",
-                                        color = if (task.percent == 100) SuccessGreen else AccentBlue,
-                                        fontSize = 10.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold
+                        // 10 Individual Worker Progress Bars in a Smooth Scrollable Column
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 240.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            state.workerTasks.forEach { task ->
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "Stream #${task.taskId} (Fr ${task.startFrame} - ${task.endFrame})",
+                                            color = Color(0xFF94A3B8),
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                        Text(
+                                            text = "${task.completedFrames}/${task.totalFrames} (${task.percent}%)",
+                                            color = if (task.percent == 100) SuccessGreen else AccentBlue,
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    LinearProgressIndicator(
+                                        progress = { task.percent / 100f },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(4.dp)
+                                            .clip(RoundedCornerShape(2.dp)),
+                                        color = if (task.percent == 100) SuccessGreen else PrimaryBlue,
+                                        trackColor = Color(0xFF1E293B)
                                     )
                                 }
-                                Spacer(modifier = Modifier.height(3.dp))
-                                LinearProgressIndicator(
-                                    progress = { task.percent / 100f },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(5.dp)
-                                        .clip(RoundedCornerShape(3.dp)),
-                                    color = if (task.percent == 100) SuccessGreen else PrimaryBlue,
-                                    trackColor = Color(0xFF1E293B)
-                                )
                             }
                         }
                     }
