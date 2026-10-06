@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
@@ -197,8 +198,6 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
             ) {
                 val currentFrame = state.frames.getOrNull(state.currentFrameIndex)
                 if (currentFrame != null) {
-                    // Asynchronously load the crisp full-resolution frame from disk,
-                    // falling back to thumbBitmap only while decoding
                     val fullBitmapState by produceState<Bitmap?>(initialValue = currentFrame.thumbBitmap, currentFrame.index) {
                         value = withContext(Dispatchers.IO) {
                             try {
@@ -393,7 +392,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         }
     }
 
-    // 2. VIDEO UPLOAD & EXTRACTION CONTROLS
+    // 2. VIDEO UPLOAD & EXTRACTION CONTROLS + IDM CONCURRENT TASKS CONTAINER
     Card(
         colors = CardDefaults.cardColors(containerColor = SurfaceDark),
         shape = RoundedCornerShape(10.dp),
@@ -449,14 +448,72 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                     }
                 }
 
-                // In-Card Progress Bar during Frame Extraction
-                if (state.isProcessing && state.progressPercent > 0) {
+                // IDM-STYLE MULTI-STREAM PROGRESS BARS CONTAINER (UP TO 5 PARALLEL TASKS)
+                if (state.isProcessing && state.workerTasks.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF090E1A))
+                            .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(8.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
+                                Text("IDM 5-Stream Parallel Extractor", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                            }
+                            Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+
+                        // 5 Individual Worker Progress Bars
+                        state.workerTasks.forEach { task ->
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = "Task #${task.taskId} (Fr ${task.startFrame} - ${task.endFrame})",
+                                        color = Color(0xFF94A3B8),
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                    Text(
+                                        text = "${task.completedFrames}/${task.totalFrames} (${task.percent}%)",
+                                        color = if (task.percent == 100) SuccessGreen else AccentBlue,
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(3.dp))
+                                LinearProgressIndicator(
+                                    progress = { task.percent / 100f },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(5.dp)
+                                        .clip(RoundedCornerShape(3.dp)),
+                                    color = if (task.percent == 100) SuccessGreen else PrimaryBlue,
+                                    trackColor = Color(0xFF1E293B)
+                                )
+                            }
+                        }
+                    }
+                } else if (state.isProcessing && state.progressPercent > 0) {
+                    // Fallback Single Master Progress Bar
                     Spacer(modifier = Modifier.height(6.dp))
                     LinearProgressIndicator(
                         progress = { state.progressPercent / 100f },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(4.dp)
+                            .height(5.dp)
                             .clip(RoundedCornerShape(2.dp)),
                         color = AccentBlue,
                         trackColor = SurfaceVariant
@@ -752,7 +809,7 @@ private fun FrameThumbnail(frame: ExtractedFrame, isActive: Boolean, onToggle: (
 }
 
 // =========================================================================
-// TAB 2: EXPORT DATA WIZARD (REDUNDANT TOP STEP BAR REMOVED)
+// TAB 2: EXPORT DATA WIZARD
 // =========================================================================
 @Composable
 private fun ExportDataWizardTab(viewModel: ToolsViewModel, state: ToolsUiState) {
@@ -778,7 +835,6 @@ private fun WizardStep1(viewModel: ToolsViewModel, state: ToolsUiState) {
             var modelExpanded by remember { mutableStateOf(false) }
             var selectedModel by remember { mutableStateOf(state.selectedGeminiModel) }
 
-            // Header with Compact Icon-Only Fetch Models Button
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -801,7 +857,6 @@ private fun WizardStep1(viewModel: ToolsViewModel, state: ToolsUiState) {
             }
             Spacer(modifier = Modifier.height(8.dp))
             
-            // Password Field with Eye Visibility Toggle
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 OutlinedTextField(
                     value = apiKey,
@@ -831,7 +886,6 @@ private fun WizardStep1(viewModel: ToolsViewModel, state: ToolsUiState) {
             }
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Gemini Model Selector Dropdown
             Box(modifier = Modifier.fillMaxWidth()) {
                 OutlinedButton(
                     onClick = { modelExpanded = true },
@@ -855,7 +909,6 @@ private fun WizardStep1(viewModel: ToolsViewModel, state: ToolsUiState) {
             }
             Spacer(modifier = Modifier.height(8.dp))
             
-            // Transcribe and Download Transcript Buttons
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Button(
                     onClick = { viewModel.transcribeAudioWithGemini(apiKey, selectedModel) },
@@ -931,7 +984,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
             Text("Auto-Scan ZIP & Apply Editora4 Tool", color = Color(0xFFE9D5FF), fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Target word input
             OutlinedTextField(
                 value = filterText,
                 onValueChange = { filterText = it },
@@ -945,7 +997,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
             )
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Dynamic Spatial Clusters Dropdown (Tab 2)
             if (state.detectedZipClusters.size > 1) {
                 Box(modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
                     OutlinedButton(
@@ -976,7 +1027,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
                 }
             }
 
-            // Dynamic Timeline Session Windows Dropdown (Tab 2)
             if (state.detectedZipTimeSlots.size > 1) {
                 Box(modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
                     OutlinedButton(
@@ -1007,7 +1057,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
                 }
             }
 
-            // Audio Cue Sync Card
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF0C1322)),
                 border = BorderStroke(1.dp, Color(0xFF1E293B)),
@@ -1054,7 +1103,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
                         }
                     }
 
-                    // Dynamic Audio Cue Dropdown
                     if (state.detectedAudioCues.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(6.dp))
                         Box(modifier = Modifier.fillMaxWidth()) {
@@ -1090,7 +1138,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Tool Selector
             Box(modifier = Modifier.fillMaxWidth()) {
                 OutlinedButton(
                     onClick = { zipToolExpanded = true },
@@ -1111,7 +1158,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // ZIP URL Input
             OutlinedTextField(
                 value = zipUrl,
                 onValueChange = { zipUrl = it },
@@ -1126,7 +1172,6 @@ private fun WizardStep2(viewModel: ToolsViewModel, state: ToolsUiState) {
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Action Buttons: URL Fetch OR Device Pick
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Button(
                     onClick = { viewModel.fetchZipFromUrl(zipUrl, filterText, selectedZipTool) },
@@ -1181,7 +1226,6 @@ private fun WizardStep3(viewModel: ToolsViewModel, state: ToolsUiState) {
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(Modifier.padding(10.dp)) {
-            // Shortened Title & Professional Icon Buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1190,7 +1234,6 @@ private fun WizardStep3(viewModel: ToolsViewModel, state: ToolsUiState) {
                 Text("HC JSON", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 14.sp)
                 
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    // Apply to Video Icon Button
                     IconButton(
                         onClick = { viewModel.applyPastedJson(pastedJson) },
                         modifier = Modifier
@@ -1200,7 +1243,6 @@ private fun WizardStep3(viewModel: ToolsViewModel, state: ToolsUiState) {
                         Icon(Icons.Default.PlayCircle, contentDescription = "Apply to Video", tint = Color.White, modifier = Modifier.size(18.dp))
                     }
 
-                    // Copy Icon Button
                     IconButton(
                         onClick = { clipboardManager.setText(AnnotatedString(pastedJson)) },
                         modifier = Modifier
@@ -1210,7 +1252,6 @@ private fun WizardStep3(viewModel: ToolsViewModel, state: ToolsUiState) {
                         Icon(Icons.Default.ContentCopy, contentDescription = "Copy JSON", tint = Color.White, modifier = Modifier.size(18.dp))
                     }
 
-                    // Download Icon Button
                     IconButton(
                         onClick = { viewModel.downloadCoordinatesJson() },
                         modifier = Modifier
@@ -1223,7 +1264,6 @@ private fun WizardStep3(viewModel: ToolsViewModel, state: ToolsUiState) {
             }
             Spacer(modifier = Modifier.height(8.dp))
             
-            // Expanded Spacious JSON Text Editor
             OutlinedTextField(
                 value = pastedJson,
                 onValueChange = { pastedJson = it },
@@ -1242,7 +1282,6 @@ private fun WizardStep3(viewModel: ToolsViewModel, state: ToolsUiState) {
 
     Spacer(modifier = Modifier.height(8.dp))
 
-    // ZIP Packager Card
     Card(
         colors = CardDefaults.cardColors(containerColor = SurfaceDark),
         border = BorderStroke(1.dp, BorderColor),
@@ -1295,7 +1334,6 @@ private fun TerminalConsole(viewModel: ToolsViewModel, state: ToolsUiState) {
         ) {
             Text("🖥️ Diagnostic Log Console", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
             
-            // Icon Action Buttons (Copy & Clear)
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 IconButton(
                     onClick = {
@@ -1382,7 +1420,6 @@ private fun RenderVideoTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                 )
             }
 
-            // Real-Time Animated Rendering Progress Bar Container
             if (state.isRendering) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Row(
