@@ -92,6 +92,18 @@ data class AudioCueUiModel(
     val endFrame: Int
 )
 
+/**
+ * Represents the real-time status of one of the 5 concurrent IDM worker streams.
+ */
+data class ExtractionWorkerTask(
+    val taskId: Int,
+    val startFrame: Int,
+    val endFrame: Int,
+    val completedFrames: Int = 0,
+    val totalFrames: Int = 0,
+    val percent: Int = 0
+)
+
 data class ToolsUiState(
     val videoUri: Uri? = null,
     val videoWidth: Int = 1080,
@@ -110,6 +122,9 @@ data class ToolsUiState(
     val statusColorHex: String = "#0284c7",
     val progressPercent: Int = 0,
     val isProcessing: Boolean = false,
+
+    // IDM Multi-Stream Parallel Worker Tasks (5 streams)
+    val workerTasks: List<ExtractionWorkerTask> = emptyList(),
 
     // Target Panel Rules & Clusters (Tab 1)
     val activeRules: List<TargetRule> = emptyList(),
@@ -306,20 +321,52 @@ class ToolsViewModel(
             statusText = "Extracting...", 
             statusColorHex = "#eab308"
         ) }
-        addLog("⚡ Starting IDM-style parallel multi-task frame extraction at $targetFps FPS...", LogType.INFO)
+        addLog("⚡ Starting IDM-style 5-stream parallel hardware frame extraction at $targetFps FPS...", LogType.INFO)
         startBackgroundKeepAlive("Extracting video frames in background...")
 
         extractionJob?.cancel()
         extractionJob = viewModelScope.launch(Dispatchers.Default) {
             try {
-                val extractedList = frameExtractor.extractFrames(uri, targetFps) { current, total ->
-                    val pct = ((current.toFloat() / total.toFloat()) * 100).toInt()
-                    _uiState.update { it.copy(
-                        statusText = "Extracting $current/$total",
-                        progressPercent = pct
-                    )}
-                    updateBackgroundKeepAlive(current, total)
-                }
+                // Initialize the 5 worker task slots in state
+                val extractedList = frameExtractor.extractFramesWithWorkers(
+                    videoUri = uri,
+                    targetFps = targetFps,
+                    onInitWorkers = { initialTasks ->
+                        _uiState.update { state ->
+                            state.copy(
+                                workerTasks = initialTasks.map { t ->
+                                    ExtractionWorkerTask(
+                                        taskId = t.taskId,
+                                        startFrame = t.startFrame,
+                                        endFrame = t.endFrame,
+                                        completedFrames = 0,
+                                        totalFrames = t.totalFrames,
+                                        percent = 0
+                                    )
+                                }
+                            )
+                        }
+                    },
+                    onWorkerProgress = { taskId, doneInWorker, totalInWorker ->
+                        _uiState.update { state ->
+                            val updatedTasks = state.workerTasks.map { task ->
+                                if (task.taskId == taskId) {
+                                    val pct = if (totalInWorker > 0) ((doneInWorker.toFloat() / totalInWorker.toFloat()) * 100).toInt() else 0
+                                    task.copy(completedFrames = doneInWorker, totalFrames = totalInWorker, percent = pct)
+                                } else task
+                            }
+                            state.copy(workerTasks = updatedTasks)
+                        }
+                    },
+                    onTotalProgress = { current, total ->
+                        val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt() else 0
+                        _uiState.update { it.copy(
+                            statusText = "Extracting $current/$total",
+                            progressPercent = pct
+                        )}
+                        updateBackgroundKeepAlive(current, total)
+                    }
+                )
 
                 withContext(Dispatchers.Main) {
                     _uiState.update { it.copy(
@@ -327,15 +374,21 @@ class ToolsViewModel(
                         isProcessing = false,
                         statusText = "${extractedList.size} Frames Ready",
                         statusColorHex = "#10b981",
-                        progressPercent = 0
+                        progressPercent = 0,
+                        workerTasks = emptyList()
                     )}
-                    addLog("✅ Successfully extracted ${extractedList.size} frames via 5-stream parallel decoding.", LogType.SUCCESS)
+                    addLog("✅ Successfully extracted ${extractedList.size} frames via 5 concurrent worker streams.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     addLog("❌ Extraction Error: ${e.message}", LogType.ERROR)
-                    _uiState.update { it.copy(isProcessing = false, statusText = "Extraction Failed", statusColorHex = "#ef4444") }
+                    _uiState.update { it.copy(
+                        isProcessing = false, 
+                        statusText = "Extraction Failed", 
+                        statusColorHex = "#ef4444",
+                        workerTasks = emptyList()
+                    ) }
                     stopBackgroundKeepAlive()
                 }
             }
@@ -857,7 +910,6 @@ class ToolsViewModel(
                     stopBackgroundKeepAlive()
                 }
 
-                // Auto-save transcript to device Downloads folder via MediaStore
                 saveTextFileToStorage(rawText, "transcript.json")
                 addLog("========================================", LogType.INFO)
 
@@ -890,7 +942,6 @@ class ToolsViewModel(
         val fps = _uiState.value.targetFps
         val filteredList = mutableListOf<AudioCueUiModel>()
 
-        // Check direct timestamp list (e.g., "17s, 30s")
         val numbersRegex = Regex("\\d+(?:\\.\\d+)?")
         val matches = numbersRegex.findAll(query).map { it.value }.toList()
         val isPureNumbers = matches.isNotEmpty() && query.replace(Regex("[\\d.,\\s]"), "").length <= 2
@@ -1080,7 +1131,7 @@ class ToolsViewModel(
             }
         }
 
-        // 3. Audio Cue Sync Filter (matches exact HTML frame-range logic)
+        // 3. Audio Cue Sync Filter
         if (state.selectedAudioCueId != "all" && state.detectedAudioCues.isNotEmpty()) {
             val cue = state.detectedAudioCues.find { it.id.toString() == state.selectedAudioCueId }
             if (cue != null) {
@@ -1099,7 +1150,7 @@ class ToolsViewModel(
             if (hasDirect) f.copy(isHighlightEnabled = true) else f.copy(isHighlightEnabled = false)
         }
 
-        // Also synchronize activeRules with the ZIP source so overlays activate in Studio Viewer
+        // Synchronize activeRules with the ZIP source
         val updatedRules = state.activeRules.filter { it.text != targetQuery }.toMutableList()
         updatedRules.add(
             TargetRule(
@@ -1309,7 +1360,6 @@ class ToolsViewModel(
                 val totalFrames = state.frames.size
                 val frameDurationUs = (1_000_000L / fps)
 
-                // Paint tools for burning overlays into video frames
                 val rectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     style = Paint.Style.STROKE
                     strokeWidth = 4f
@@ -1322,7 +1372,6 @@ class ToolsViewModel(
                     val frameObj = state.frames[i]
                     val ptsUs = i * frameDurationUs
 
-                    // Load full resolution frame
                     val fullBitmap = try {
                         val file = File(frameObj.fullResImagePath)
                         if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else frameObj.thumbBitmap
@@ -1330,7 +1379,6 @@ class ToolsViewModel(
                         frameObj.thumbBitmap
                     } ?: continue
 
-                    // Lock surface canvas to burn overlays
                     val surfaceCanvas: Canvas? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         inputSurface.lockHardwareCanvas()
                     } else {
@@ -1341,7 +1389,6 @@ class ToolsViewModel(
                         try {
                             surfaceCanvas.drawBitmap(fullBitmap, 0f, 0f, null)
 
-                            // Burn direct highlights if enabled
                             if (frameObj.isHighlightEnabled) {
                                 val boxes = state.directBlurs[frameObj.index] ?: emptyList()
                                 val timeMs = (frameObj.timeSeconds * 1000).toLong()
@@ -1354,7 +1401,6 @@ class ToolsViewModel(
                                     val bw = box.width + pad * 2f
                                     val bh = box.height + pad * 2f
 
-                                    // Button Highlight (Pulsing Brackets)
                                     fillPaint.color = android.graphics.Color.argb(
                                         ((0.12f + pulse * 0.22f) * 255).toInt(), 245, 158, 11
                                     )
@@ -1374,7 +1420,6 @@ class ToolsViewModel(
                         fullBitmap.recycle()
                     }
 
-                    // Drain encoder output buffers
                     var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
                     while (outIndex >= 0) {
                         val encodedData = encoder.getOutputBuffer(outIndex)
@@ -1400,7 +1445,6 @@ class ToolsViewModel(
                     updateBackgroundKeepAlive(i + 1, totalFrames)
                 }
 
-                // Signal end of stream
                 encoder.signalEndOfInputStream()
                 var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 20000)
                 while (outIndex >= 0) {
@@ -1422,7 +1466,6 @@ class ToolsViewModel(
                     videoMuxer.release()
                 }
 
-                // Step 3: Combine encoded video track with original audio track
                 val finalExportFile = if (hasAudio && tempVideoFile.exists()) {
                     mergeVideoAndAudio(tempVideoFile, tempAudioFile, tempFinalFile)
                     tempFinalFile
@@ -1430,7 +1473,6 @@ class ToolsViewModel(
                     tempVideoFile
                 }
 
-                // Step 4: Export final video to device Movies / Downloads using MediaStore
                 val filename = "full_video_with_editora_effects_${System.currentTimeMillis()}.mp4"
                 saveVideoToMediaStore(finalExportFile, filename)
 
@@ -1548,9 +1590,6 @@ class ToolsViewModel(
         }
     }
 
-    /**
-     * Saves text/JSON payloads directly to public Downloads folder using MediaStore (Android 10+ compliant).
-     */
     private fun saveTextFileToStorage(content: String, filename: String) {
         val context = getApplication<Application>()
         try {
