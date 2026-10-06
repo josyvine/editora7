@@ -53,7 +53,8 @@ data class WorkerInitInfo(
 class FastNativeFrameExtractor(private val context: Context) {
 
     /**
-     * IDM-Style 5-Stream Parallel Extraction with per-worker real-time progress callbacks.
+     * IDM-Style 10-Stream Parallel Extraction with per-worker real-time progress callbacks.
+     * Each of the 10 concurrent streams decodes 10 frames per batch.
      */
     suspend fun extractFramesWithWorkers(
         videoUri: Uri,
@@ -113,8 +114,8 @@ class FastNativeFrameExtractor(private val context: Context) {
 
         val intervalUs = (1_000_000L / targetFps)
 
-        // IDM partition into 5 concurrent worker streams
-        val workerCount = 5
+        // IDM partition into 10 concurrent worker streams
+        val workerCount = 10
         val chunkSize = ceil(totalFrames.toFloat() / workerCount.toFloat()).toInt()
 
         val workerInitList = (0 until workerCount).map { i ->
@@ -147,7 +148,7 @@ class FastNativeFrameExtractor(private val context: Context) {
                 try {
                     workerRetriever.setDataSource(context, videoUri)
 
-                    // Process chunk in mini-batches of 10
+                    // Process chunk in mini-batches of 10 frames at a time
                     val batchSize = 10
                     var currentBatchStart = workerInfo.startFrame
                     val workerEndBound = workerInfo.endFrame + 1
