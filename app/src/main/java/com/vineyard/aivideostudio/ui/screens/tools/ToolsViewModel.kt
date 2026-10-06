@@ -2,6 +2,7 @@ package com.vineyard.aivideostudio.ui.screens.tools
 
 import android.app.Application
 import android.content.ContentValues
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -33,6 +34,7 @@ import com.vineyard.aivideostudio.media.tools.TimeSlotSession
 import com.vineyard.aivideostudio.media.tools.ZipOcrFrame
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
 import com.vineyard.aivideostudio.media.video.FastNativeFrameExtractor
+import com.vineyard.aivideostudio.processing.worker.VideoProcessingForegroundService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -177,6 +179,46 @@ class ToolsViewModel(
     }
 
     // =========================================================
+    // FOREGROUND SERVICE CONTROL (PREVENTS BACKGROUND FREEZE)
+    // =========================================================
+    private fun startBackgroundKeepAlive(notificationText: String) {
+        val app = getApplication<Application>()
+        try {
+            val serviceIntent = Intent(app, VideoProcessingForegroundService::class.java).apply {
+                action = VideoProcessingForegroundService.ACTION_START_FOREGROUND
+                putExtra(VideoProcessingForegroundService.EXTRA_NOTIFICATION_TEXT, notificationText)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                app.startForegroundService(serviceIntent)
+            } else {
+                app.startService(serviceIntent)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun updateBackgroundKeepAlive(progress: Int, total: Int) {
+        val app = getApplication<Application>()
+        try {
+            val serviceIntent = Intent(app, VideoProcessingForegroundService::class.java).apply {
+                action = VideoProcessingForegroundService.ACTION_UPDATE_PROGRESS
+                putExtra(VideoProcessingForegroundService.EXTRA_PROGRESS, progress)
+                putExtra(VideoProcessingForegroundService.EXTRA_TOTAL, total)
+            }
+            app.startService(serviceIntent)
+        } catch (_: Exception) {}
+    }
+
+    private fun stopBackgroundKeepAlive() {
+        val app = getApplication<Application>()
+        try {
+            val serviceIntent = Intent(app, VideoProcessingForegroundService::class.java).apply {
+                action = VideoProcessingForegroundService.ACTION_STOP_FOREGROUND
+            }
+            app.startService(serviceIntent)
+        } catch (_: Exception) {}
+    }
+
+    // =========================================================
     // TERMINAL LOGGING
     // =========================================================
     fun addLog(message: String, type: LogType = LogType.INFO) {
@@ -264,7 +306,8 @@ class ToolsViewModel(
             statusText = "Extracting...", 
             statusColorHex = "#eab308"
         ) }
-        addLog("🎞️ Starting hardware-accelerated frame extraction at $targetFps FPS...", LogType.INFO)
+        addLog("⚡ Starting IDM-style parallel multi-task frame extraction at $targetFps FPS...", LogType.INFO)
+        startBackgroundKeepAlive("Extracting video frames in background...")
 
         extractionJob?.cancel()
         extractionJob = viewModelScope.launch(Dispatchers.Default) {
@@ -275,6 +318,7 @@ class ToolsViewModel(
                         statusText = "Extracting $current/$total",
                         progressPercent = pct
                     )}
+                    updateBackgroundKeepAlive(current, total)
                 }
 
                 withContext(Dispatchers.Main) {
@@ -285,12 +329,14 @@ class ToolsViewModel(
                         statusColorHex = "#10b981",
                         progressPercent = 0
                     )}
-                    addLog("✅ Successfully extracted ${extractedList.size} frames to persistent cache.", LogType.SUCCESS)
+                    addLog("✅ Successfully extracted ${extractedList.size} frames via 5-stream parallel decoding.", LogType.SUCCESS)
+                    stopBackgroundKeepAlive()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     addLog("❌ Extraction Error: ${e.message}", LogType.ERROR)
                     _uiState.update { it.copy(isProcessing = false, statusText = "Extraction Failed", statusColorHex = "#ef4444") }
+                    stopBackgroundKeepAlive()
                 }
             }
         }
@@ -456,15 +502,17 @@ class ToolsViewModel(
 
         _uiState.update { it.copy(isProcessing = true, statusText = "Ultra-Fast OCR...", statusColorHex = "#eab308", slotStep = 0) }
         addLog("🚀 Initiating parallel native OCR scan on ${framesToScan.size} frames...", LogType.INFO)
+        startBackgroundKeepAlive("Running OCR on captured frames...")
 
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                val batchResults = ocrEngine.scanBatch(framesToScan, parallelWorkers = 3) { current, total ->
+                val batchResults = ocrEngine.scanBatch(framesToScan, parallelWorkers = 5) { current, total ->
                     val pct = ((current.toFloat() / total.toFloat()) * 100).toInt()
                     _uiState.update { it.copy(
                         statusText = "OCR: $current/$total",
                         progressPercent = pct
                     )}
+                    updateBackgroundKeepAlive(current, total)
                 }
 
                 val updatedMap = _uiState.value.extractedOcrData.toMutableMap()
@@ -479,12 +527,14 @@ class ToolsViewModel(
                         statusColorHex = "#10b981"
                     )}
                     addLog("✅ Ultra-Fast OCR completed successfully.", LogType.SUCCESS)
+                    stopBackgroundKeepAlive()
                     updateExportedJsonState()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     addLog("❌ OCR Batch Error: ${e.message}", LogType.ERROR)
                     _uiState.update { it.copy(isProcessing = false, statusText = "OCR Failed", statusColorHex = "#ef4444") }
+                    stopBackgroundKeepAlive()
                 }
             }
         }
@@ -713,6 +763,7 @@ class ToolsViewModel(
         _uiState.update { it.copy(isProcessing = true, statusText = "Extracting Audio...", statusColorHex = "#eab308") }
         addLog("========================================", LogType.INFO)
         addLog("🚀 [PIPELINE START] Native Audio Transcription.", LogType.INFO)
+        startBackgroundKeepAlive("Transcribing audio with Gemini AI...")
 
         viewModelScope.launch(Dispatchers.IO) {
             val audioOutputFile = File(getApplication<Application>().cacheDir, "temp_extracted_audio.m4a")
@@ -803,6 +854,7 @@ class ToolsViewModel(
                         statusColorHex = "#10b981"
                     )}
                     filterAudioCues("")
+                    stopBackgroundKeepAlive()
                 }
 
                 // Auto-save transcript to device Downloads folder via MediaStore
@@ -814,6 +866,7 @@ class ToolsViewModel(
                 withContext(Dispatchers.Main) {
                     addLog("❌ PIPELINE EXCEPTION: ${e.message}", LogType.ERROR)
                     _uiState.update { it.copy(isProcessing = false, statusText = "Transcription Failed", statusColorHex = "#ef4444") }
+                    stopBackgroundKeepAlive()
                 }
             } finally {
                 if (audioOutputFile.exists()) {
@@ -1212,6 +1265,7 @@ class ToolsViewModel(
 
         _uiState.update { it.copy(isRendering = true, renderPercent = 0, renderProgressStatus = "Preparing Video & Audio...") }
         addLog("🎬 Starting full video rendering with original synchronized audio...", LogType.INFO)
+        startBackgroundKeepAlive("Rendering edited video in background...")
 
         viewModelScope.launch(Dispatchers.Default) {
             val context = getApplication<Application>()
@@ -1343,6 +1397,7 @@ class ToolsViewModel(
                         renderPercent = pct,
                         renderProgressStatus = "Burning frame ${i + 1}/$totalFrames (Normal Speed Sync)..."
                     )}
+                    updateBackgroundKeepAlive(i + 1, totalFrames)
                 }
 
                 // Signal end of stream
@@ -1388,6 +1443,7 @@ class ToolsViewModel(
                         statusColorHex = "#10b981"
                     )}
                     addLog("🎉 SUCCESS: Full video rendered with synchronized audio and saved to gallery.", LogType.SUCCESS)
+                    stopBackgroundKeepAlive()
                 }
 
             } catch (e: Exception) {
@@ -1400,6 +1456,7 @@ class ToolsViewModel(
                         statusText = "Render Failed",
                         statusColorHex = "#ef4444"
                     )}
+                    stopBackgroundKeepAlive()
                 }
             } finally {
                 tempAudioFile.delete()
@@ -1587,6 +1644,7 @@ class ToolsViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        stopBackgroundKeepAlive()
         playbackJob?.cancel()
         releaseMediaPlayer()
         ocrEngine.close()
