@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * [maxConcurrentWorkers] parallel streams pulling [batchSize] frames simultaneously.
  */
 class ConcurrentBatchExtractor(
-    private val maxConcurrentWorkers: Int = 5,
+    private val maxConcurrentWorkers: Int = 10,
     private val batchSize: Int = 10
 ) {
 
