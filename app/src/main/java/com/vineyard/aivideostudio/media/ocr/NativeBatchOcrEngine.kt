@@ -14,14 +14,21 @@ import com.vineyard.aivideostudio.media.tools.ToolsBoundingBox
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.min
 
 /**
  * Structured OCR result representing all detected text blocks, lines, and words on a single frame.
@@ -119,56 +126,90 @@ class NativeBatchOcrEngine {
     }
 
     /**
-     * Scans multiple frames at high speed with perceptual deduplication.
-     * Skips redundant ML Kit inferences on static video frames, completing batch scans up to 10x faster.
+     * Scans multiple frames at high speed with perceptual deduplication and IDM-style parallel concurrency.
+     * Divides workload across concurrent worker streams and processes sub-batches of 10 frames simultaneously.
      */
     suspend fun scanBatch(
         frames: List<ExtractedFrame>,
-        parallelWorkers: Int = 3,
+        parallelWorkers: Int = 5,
         onProgress: (current: Int, total: Int) -> Unit
     ): Map<Int, FrameOcrData> = withContext(Dispatchers.IO) {
-        val resultsMap = mutableMapOf<Int, FrameOcrData>()
         val totalCount = frames.size
-        if (totalCount == 0) return@withContext resultsMap
+        if (totalCount == 0) return@withContext emptyMap()
 
-        // Sort chronologically to enable frame-to-frame deduplication
+        // Sort chronologically before splitting to preserve timeline sequence
         val sortedFrames = frames.sortedBy { it.index }
+        val resultsMap = ConcurrentHashMap<Int, FrameOcrData>()
         val completedCounter = AtomicInteger(0)
-        var lastProgressDispatchTime = 0L
+        val lastProgressDispatchTime = AtomicLong(0L)
 
-        var lastScannedFrame: ExtractedFrame? = null
-        var lastOcrData: FrameOcrData? = null
+        // IDM partition into 5 concurrent worker streams
+        val workerCount = min(parallelWorkers.coerceAtLeast(1), 5)
+        val chunkSize = ceil(totalCount.toFloat() / workerCount.toFloat()).toInt()
 
-        for (frame in sortedFrames) {
-            // Check if current frame is visually identical to the previous frame
-            if (lastScannedFrame != null && lastOcrData != null &&
-                areBitmapsSimilar(lastScannedFrame.thumbBitmap, frame.thumbBitmap)) {
-                // Instantly reuse OCR data without running ML Kit
-                val reusedData = FrameOcrData(
-                    frameIndex = frame.index,
-                    time = frame.timeSeconds,
-                    lines = lastOcrData.lines
-                )
-                resultsMap[frame.index] = reusedData
-            } else {
-                // Visual change detected: execute ML Kit inference
-                val ocrData = scanFrame(frame)
-                resultsMap[frame.index] = ocrData
-                lastScannedFrame = frame
-                lastOcrData = ocrData
-            }
+        val deferredWorkers = (0 until workerCount).map { workerIndex ->
+            val startIdx = workerIndex * chunkSize
+            val endIdx = min(totalCount, startIdx + chunkSize)
 
-            val completed = completedCounter.incrementAndGet()
-            val now = System.currentTimeMillis()
-            if (now - lastProgressDispatchTime > 80 || completed == totalCount) {
-                lastProgressDispatchTime = now
-                withContext(Dispatchers.Main) {
-                    onProgress(completed, totalCount)
+            async(Dispatchers.IO) {
+                if (startIdx >= endIdx) return@async
+
+                var lastScannedFrame: ExtractedFrame? = null
+                var lastOcrData: FrameOcrData? = null
+
+                // Process in mini-batches of 10
+                val batchSize = 10
+                var batchStart = startIdx
+
+                while (batchStart < endIdx && isActive) {
+                    val batchEnd = min(endIdx, batchStart + batchSize)
+
+                    for (i in batchStart until batchEnd) {
+                        if (!isActive) break
+                        val frame = sortedFrames[i]
+
+                        // Check perceptual similarity within this continuous timeline segment
+                        if (lastScannedFrame != null && lastOcrData != null &&
+                            areBitmapsSimilar(lastScannedFrame.thumbBitmap, frame.thumbBitmap)
+                        ) {
+                            val reusedData = FrameOcrData(
+                                frameIndex = frame.index,
+                                time = frame.timeSeconds,
+                                lines = lastOcrData.lines
+                            )
+                            resultsMap[frame.index] = reusedData
+                        } else {
+                            val ocrData = scanFrame(frame)
+                            resultsMap[frame.index] = ocrData
+                            lastScannedFrame = frame
+                            lastOcrData = ocrData
+                        }
+
+                        val completed = completedCounter.incrementAndGet()
+                        val now = System.currentTimeMillis()
+                        val lastTime = lastProgressDispatchTime.get()
+
+                        if (now - lastTime > 60 || completed == totalCount) {
+                            if (lastProgressDispatchTime.compareAndSet(lastTime, now)) {
+                                withContext(Dispatchers.Main) {
+                                    onProgress(completed, totalCount)
+                                }
+                            }
+                        }
+                    }
+
+                    batchStart = batchEnd
                 }
             }
         }
 
-        resultsMap
+        deferredWorkers.awaitAll()
+
+        withContext(Dispatchers.Main) {
+            onProgress(resultsMap.size, totalCount)
+        }
+
+        resultsMap.toSortedMap()
     }
 
     /**
