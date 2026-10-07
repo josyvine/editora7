@@ -15,7 +15,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
@@ -135,7 +134,6 @@ class FastNativeFrameExtractor(private val context: Context) {
         }
 
         val completedCounter = AtomicInteger(0)
-        val lastProgressDispatchTime = AtomicLong(0L)
 
         val deferredWorkers = workerInitList.map { workerInfo ->
             async(Dispatchers.IO) {
@@ -148,13 +146,14 @@ class FastNativeFrameExtractor(private val context: Context) {
                 try {
                     workerRetriever.setDataSource(context, videoUri)
 
-                    // Process chunk in mini-batches of 10 frames at a time
+                    // Process chunk in discrete mini-batches of 10 frames at a time
                     val batchSize = 10
                     var currentBatchStart = workerInfo.startFrame
                     val workerEndBound = workerInfo.endFrame + 1
 
                     while (currentBatchStart < workerEndBound && isActive) {
                         val currentBatchEnd = min(workerEndBound, currentBatchStart + batchSize)
+                        var framesProcessedInBatch = 0
 
                         for (i in currentBatchStart until currentBatchEnd) {
                             if (!isActive) break
@@ -209,24 +208,18 @@ class FastNativeFrameExtractor(private val context: Context) {
                                 )
                             )
 
-                            workerDoneCount++
-                            val completed = completedCounter.incrementAndGet()
-                            val now = System.currentTimeMillis()
-                            val lastTime = lastProgressDispatchTime.get()
-
-                            if (now - lastTime > 50 || completed == totalFrames) {
-                                if (lastProgressDispatchTime.compareAndSet(lastTime, now)) {
-                                    withContext(Dispatchers.Main) {
-                                        onWorkerProgress(workerInfo.taskId, workerDoneCount, workerInfo.totalFrames)
-                                        onTotalProgress(completed, totalFrames)
-                                    }
-                                }
-                            }
+                            framesProcessedInBatch++
                         }
 
-                        // Dispatch progress at end of each batch of 10
-                        withContext(Dispatchers.Main) {
-                            onWorkerProgress(workerInfo.taskId, workerDoneCount, workerInfo.totalFrames)
+                        // Dispatch progress strictly per 10-frame batch completed
+                        if (framesProcessedInBatch > 0) {
+                            workerDoneCount += framesProcessedInBatch
+                            val completed = completedCounter.addAndGet(framesProcessedInBatch)
+                            
+                            withContext(Dispatchers.Main) {
+                                onWorkerProgress(workerInfo.taskId, workerDoneCount, workerInfo.totalFrames)
+                                onTotalProgress(completed, totalFrames)
+                            }
                         }
 
                         currentBatchStart = currentBatchEnd
