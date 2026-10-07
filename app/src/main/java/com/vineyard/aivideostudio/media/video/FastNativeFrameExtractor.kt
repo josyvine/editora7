@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -46,8 +47,8 @@ data class WorkerInitInfo(
 
 /**
  * High-performance, multi-threaded native frame extraction engine.
- * Employs parallel hardware decoding workers and SIMD JPEG stream buffering
- * to match desktop-class extraction speeds without memory leaks.
+ * Uses direct kernel file descriptors, parallel hardware decoding workers,
+ * and pipelined stream buffering for maximum extraction speeds.
  */
 class FastNativeFrameExtractor(private val context: Context) {
 
@@ -69,13 +70,25 @@ class FastNativeFrameExtractor(private val context: Context) {
         }
         workspaceDir.mkdirs()
 
+        // Acquire direct kernel ParcelFileDescriptor to eliminate Binder IPC bottlenecks
+        val masterPfd: ParcelFileDescriptor? = try {
+            context.contentResolver.openFileDescriptor(videoUri, "r")
+        } catch (_: Exception) {
+            null
+        }
+
         val probeRetriever = MediaMetadataRetriever()
         val durationSec: Float
         val targetDecodeWidth: Int
         val targetDecodeHeight: Int
 
         try {
-            probeRetriever.setDataSource(context, videoUri)
+            if (masterPfd != null) {
+                probeRetriever.setDataSource(masterPfd.fileDescriptor)
+            } else {
+                probeRetriever.setDataSource(context, videoUri)
+            }
+
             val durationMs = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
             durationSec = durationMs / 1000f
 
@@ -109,7 +122,10 @@ class FastNativeFrameExtractor(private val context: Context) {
         }
 
         val totalFrames = floor(durationSec * targetFps).toInt()
-        if (totalFrames <= 0) return@withContext emptyList()
+        if (totalFrames <= 0) {
+            try { masterPfd?.close() } catch (_: Exception) {}
+            return@withContext emptyList()
+        }
 
         val intervalUs = (1_000_000L / targetFps)
 
@@ -135,113 +151,121 @@ class FastNativeFrameExtractor(private val context: Context) {
 
         val completedCounter = AtomicInteger(0)
 
-        val deferredWorkers = workerInitList.map { workerInfo ->
-            async(Dispatchers.IO) {
-                if (workerInfo.totalFrames <= 0) return@async emptyList<ExtractedFrame>()
+        try {
+            val deferredWorkers = workerInitList.map { workerInfo ->
+                async(Dispatchers.IO) {
+                    if (workerInfo.totalFrames <= 0) return@async emptyList<ExtractedFrame>()
 
-                val workerFrames = mutableListOf<ExtractedFrame>()
-                val workerRetriever = MediaMetadataRetriever()
-                var workerDoneCount = 0
+                    val workerFrames = mutableListOf<ExtractedFrame>()
+                    val workerRetriever = MediaMetadataRetriever()
+                    var workerDoneCount = 0
 
-                try {
-                    workerRetriever.setDataSource(context, videoUri)
+                    try {
+                        // Use direct native file descriptor to avoid cross-process locks
+                        if (masterPfd != null) {
+                            workerRetriever.setDataSource(masterPfd.fileDescriptor)
+                        } else {
+                            workerRetriever.setDataSource(context, videoUri)
+                        }
 
-                    // Process chunk in discrete mini-batches of 10 frames at a time
-                    val batchSize = 10
-                    var currentBatchStart = workerInfo.startFrame
-                    val workerEndBound = workerInfo.endFrame + 1
+                        val batchSize = 10
+                        var currentBatchStart = workerInfo.startFrame
+                        val workerEndBound = workerInfo.endFrame + 1
 
-                    while (currentBatchStart < workerEndBound && isActive) {
-                        val currentBatchEnd = min(workerEndBound, currentBatchStart + batchSize)
-                        var framesProcessedInBatch = 0
+                        while (currentBatchStart < workerEndBound && isActive) {
+                            val currentBatchEnd = min(workerEndBound, currentBatchStart + batchSize)
+                            var framesProcessedInBatch = 0
 
-                        for (i in currentBatchStart until currentBatchEnd) {
-                            if (!isActive) break
+                            for (i in currentBatchStart until currentBatchEnd) {
+                                if (!isActive) break
 
-                            val targetTimeUs = i * intervalUs
-                            val timeSec = targetTimeUs / 1_000_000f
+                                val targetTimeUs = i * intervalUs
+                                val timeSec = targetTimeUs / 1_000_000f
 
-                            // High-speed scaled hardware frame decoding
-                            val frameBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && targetDecodeWidth > 0 && targetDecodeHeight > 0) {
-                                workerRetriever.getScaledFrameAtTime(
-                                    targetTimeUs,
-                                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                                    targetDecodeWidth,
-                                    targetDecodeHeight
-                                ) ?: workerRetriever.getScaledFrameAtTime(
-                                    targetTimeUs,
-                                    MediaMetadataRetriever.OPTION_CLOSEST,
-                                    targetDecodeWidth,
-                                    targetDecodeHeight
-                                ) ?: workerRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                            } else {
-                                workerRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                            } ?: continue
+                                // Hardware-accelerated scaled frame retrieval
+                                val frameBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && targetDecodeWidth > 0 && targetDecodeHeight > 0) {
+                                    workerRetriever.getScaledFrameAtTime(
+                                        targetTimeUs,
+                                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                                        targetDecodeWidth,
+                                        targetDecodeHeight
+                                    ) ?: workerRetriever.getScaledFrameAtTime(
+                                        targetTimeUs,
+                                        MediaMetadataRetriever.OPTION_CLOSEST,
+                                        targetDecodeWidth,
+                                        targetDecodeHeight
+                                    ) ?: workerRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                } else {
+                                    workerRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                } ?: continue
 
-                            // 1. Lightweight thumbnail for filmstrip UI (width: 120px)
-                            val thumbWidth = 120
-                            val aspect = frameBitmap.height.toFloat() / frameBitmap.width.toFloat()
-                            val thumbHeight = (thumbWidth * aspect).roundToInt().coerceAtLeast(1)
-                            val thumbBitmap = Bitmap.createScaledBitmap(frameBitmap, thumbWidth, thumbHeight, true)
+                                // 1. Fast in-memory thumbnail for filmstrip UI (width: 120px)
+                                val thumbWidth = 120
+                                val aspect = frameBitmap.height.toFloat() / frameBitmap.width.toFloat()
+                                val thumbHeight = (thumbWidth * aspect).roundToInt().coerceAtLeast(1)
+                                val thumbBitmap = Bitmap.createScaledBitmap(frameBitmap, thumbWidth, thumbHeight, false)
 
-                            // 2. High-speed buffered stream write (JPEG 75 SIMD compression)
-                            val frameFile = File(workspaceDir, "frame_$i.jpg")
-                            try {
-                                BufferedOutputStream(FileOutputStream(frameFile), 65536).use { outStream ->
-                                    frameBitmap.compress(Bitmap.CompressFormat.JPEG, 75, outStream)
+                                // 2. High-speed 64KB buffered stream write
+                                val frameFile = File(workspaceDir, "frame_$i.jpg")
+                                try {
+                                    BufferedOutputStream(FileOutputStream(frameFile), 65536).use { outStream ->
+                                        frameBitmap.compress(Bitmap.CompressFormat.JPEG, 75, outStream)
+                                    }
+                                } catch (writeErr: Exception) {
+                                    writeErr.printStackTrace()
                                 }
-                            } catch (writeErr: Exception) {
-                                writeErr.printStackTrace()
-                            }
 
-                            frameBitmap.recycle()
+                                frameBitmap.recycle()
 
-                            val timeFormatted = String.format(Locale.US, "%.2f", timeSec)
+                                val timeFormatted = String.format(Locale.US, "%.2f", timeSec)
 
-                            workerFrames.add(
-                                ExtractedFrame(
-                                    index = i,
-                                    timeSeconds = timeSec,
-                                    timeFormatted = timeFormatted,
-                                    fullResImagePath = frameFile.absolutePath,
-                                    thumbBitmap = thumbBitmap
+                                workerFrames.add(
+                                    ExtractedFrame(
+                                        index = i,
+                                        timeSeconds = timeSec,
+                                        timeFormatted = timeFormatted,
+                                        fullResImagePath = frameFile.absolutePath,
+                                        thumbBitmap = thumbBitmap
+                                    )
                                 )
-                            )
 
-                            framesProcessedInBatch++
-                        }
-
-                        // Dispatch progress strictly per 10-frame batch completed
-                        if (framesProcessedInBatch > 0) {
-                            workerDoneCount += framesProcessedInBatch
-                            val completed = completedCounter.addAndGet(framesProcessedInBatch)
-                            
-                            withContext(Dispatchers.Main) {
-                                onWorkerProgress(workerInfo.taskId, workerDoneCount, workerInfo.totalFrames)
-                                onTotalProgress(completed, totalFrames)
+                                framesProcessedInBatch++
                             }
+
+                            // Dispatch progress strictly per 10-frame batch completed
+                            if (framesProcessedInBatch > 0) {
+                                workerDoneCount += framesProcessedInBatch
+                                val completed = completedCounter.addAndGet(framesProcessedInBatch)
+
+                                withContext(Dispatchers.Main) {
+                                    onWorkerProgress(workerInfo.taskId, workerDoneCount, workerInfo.totalFrames)
+                                    onTotalProgress(completed, totalFrames)
+                                }
+                            }
+
+                            currentBatchStart = currentBatchEnd
                         }
-
-                        currentBatchStart = currentBatchEnd
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    } finally {
+                        try { workerRetriever.release() } catch (_: Exception) {}
                     }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                } finally {
-                    try { workerRetriever.release() } catch (_: Exception) {}
+
+                    workerFrames
                 }
-
-                workerFrames
             }
+
+            val allChunks = deferredWorkers.awaitAll()
+            val sortedFrames = allChunks.flatten().sortedBy { it.index }
+
+            withContext(Dispatchers.Main) {
+                onTotalProgress(sortedFrames.size, totalFrames)
+            }
+
+            return@withContext sortedFrames
+        } finally {
+            try { masterPfd?.close() } catch (_: Exception) {}
         }
-
-        val allChunks = deferredWorkers.awaitAll()
-        val sortedFrames = allChunks.flatten().sortedBy { it.index }
-
-        withContext(Dispatchers.Main) {
-            onTotalProgress(sortedFrames.size, totalFrames)
-        }
-
-        return@withContext sortedFrames
     }
 
     /**
