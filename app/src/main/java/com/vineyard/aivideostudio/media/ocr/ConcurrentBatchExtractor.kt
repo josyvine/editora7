@@ -64,6 +64,7 @@ class ConcurrentBatchExtractor(
             val taskList = chunks.map { chunk ->
                 async(Dispatchers.IO) {
                     concurrencyLimiter.withPermit {
+                        var processedInBatch = 0
                         for (i in chunk.indices.indices) {
                             val frameIdx = chunk.indices[i]
                             val timeMs = chunk.timestampsMs[i]
@@ -72,7 +73,12 @@ class ConcurrentBatchExtractor(
                             if (bmp != null) {
                                 resultMap[frameIdx] = bmp
                             }
-                            val done = completedCounter.incrementAndGet()
+                            processedInBatch++
+                        }
+                        
+                        // Emit progress per batch (steps of 10) instead of frame-by-frame (+1)
+                        if (processedInBatch > 0) {
+                            val done = completedCounter.addAndGet(processedInBatch)
                             onProgress(done, total)
                         }
                     }
