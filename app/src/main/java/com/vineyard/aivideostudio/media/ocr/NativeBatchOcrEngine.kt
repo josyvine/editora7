@@ -25,7 +25,6 @@ import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.min
@@ -141,9 +140,8 @@ class NativeBatchOcrEngine {
         val sortedFrames = frames.sortedBy { it.index }
         val resultsMap = ConcurrentHashMap<Int, FrameOcrData>()
         val completedCounter = AtomicInteger(0)
-        val lastProgressDispatchTime = AtomicLong(0L)
 
-        // IDM partition into 5 concurrent worker streams
+        // IDM partition into concurrent worker streams
         val workerCount = min(parallelWorkers.coerceAtLeast(1), 5)
         val chunkSize = ceil(totalCount.toFloat() / workerCount.toFloat()).toInt()
 
@@ -157,12 +155,13 @@ class NativeBatchOcrEngine {
                 var lastScannedFrame: ExtractedFrame? = null
                 var lastOcrData: FrameOcrData? = null
 
-                // Process in mini-batches of 10
+                // Process in mini-batches of 10 frames
                 val batchSize = 10
                 var batchStart = startIdx
 
                 while (batchStart < endIdx && isActive) {
                     val batchEnd = min(endIdx, batchStart + batchSize)
+                    var batchDoneCount = 0
 
                     for (i in batchStart until batchEnd) {
                         if (!isActive) break
@@ -185,16 +184,14 @@ class NativeBatchOcrEngine {
                             lastOcrData = ocrData
                         }
 
-                        val completed = completedCounter.incrementAndGet()
-                        val now = System.currentTimeMillis()
-                        val lastTime = lastProgressDispatchTime.get()
+                        batchDoneCount++
+                    }
 
-                        if (now - lastTime > 60 || completed == totalCount) {
-                            if (lastProgressDispatchTime.compareAndSet(lastTime, now)) {
-                                withContext(Dispatchers.Main) {
-                                    onProgress(completed, totalCount)
-                                }
-                            }
+                    // Dispatch progress strictly per 10-frame mini-batch completed
+                    if (batchDoneCount > 0) {
+                        val done = completedCounter.addAndGet(batchDoneCount)
+                        withContext(Dispatchers.Main) {
+                            onProgress(done, totalCount)
                         }
                     }
 
