@@ -53,7 +53,7 @@ class FastNativeFrameExtractor(private val context: Context) {
 
     /**
      * IDM-Style 10-Stream Parallel Extraction with per-worker real-time progress callbacks.
-     * Each of the 10 concurrent streams decodes 10 frames per batch independently.
+     * Each of the 10 concurrent streams decodes 100 frames per batch independently (1,000 frames/cycle across 10 streams).
      */
     suspend fun extractFramesWithWorkers(
         videoUri: Uri,
@@ -171,7 +171,8 @@ class FastNativeFrameExtractor(private val context: Context) {
                         workerRetriever.setDataSource(context, videoUri)
                     }
 
-                    val batchSize = 10
+                    // 100 frames per batch (1,000 frames total across 10 streams)
+                    val batchSize = 100
                     var currentBatchStart = workerInfo.startFrame
                     val workerEndBound = workerInfo.endFrame + 1
 
@@ -235,7 +236,7 @@ class FastNativeFrameExtractor(private val context: Context) {
                             framesProcessedInBatch++
                         }
 
-                        // Emit progress per 10-frame batch completed
+                        // Emit progress strictly per 100-frame batch completed
                         if (framesProcessedInBatch > 0) {
                             workerDoneCount += framesProcessedInBatch
                             val completed = completedCounter.addAndGet(framesProcessedInBatch)
