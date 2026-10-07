@@ -351,7 +351,9 @@ class ToolsViewModel(
                         _uiState.update { state ->
                             val updatedTasks = state.workerTasks.map { task ->
                                 if (task.taskId == taskId) {
-                                    val pct = if (totalInWorker > 0) ((doneInWorker.toFloat() / totalInWorker.toFloat()) * 100).toInt() else 0
+                                    val pct = if (totalInWorker > 0) {
+                                        ((doneInWorker.toFloat() / totalInWorker.toFloat()) * 100).toInt().coerceIn(0, 100)
+                                    } else 0
                                     task.copy(completedFrames = doneInWorker, totalFrames = totalInWorker, percent = pct)
                                 } else task
                             }
@@ -359,7 +361,7 @@ class ToolsViewModel(
                         }
                     },
                     onTotalProgress = { current, total ->
-                        val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt() else 0
+                        val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt().coerceIn(0, 100) else 0
                         _uiState.update { it.copy(
                             statusText = "Extracting $current/$total",
                             progressPercent = pct
@@ -1673,7 +1675,7 @@ class ToolsViewModel(
                 muxer.stop()
                 muxer.release()
             } catch (_: Exception) {}
-            extractor.release()
+                extractor.release()
         }
     }
 
