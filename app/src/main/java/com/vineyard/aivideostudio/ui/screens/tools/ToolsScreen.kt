@@ -467,7 +467,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
-                                Text("IDM 10-Stream Parallel Extractor (10 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                Text("IDM 10-Stream Parallel Extractor (100 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                             }
                             Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         }
@@ -1396,7 +1396,7 @@ private fun TerminalConsole(viewModel: ToolsViewModel, state: ToolsUiState) {
 
 // =========================================================================
 // TAB 3: RENDER VIDEO WITH REAL-TIME PROGRESS BAR
-// =========================================================================
+// =========================================================
 @Composable
 private fun RenderVideoTab(viewModel: ToolsViewModel, state: ToolsUiState) {
     Card(
