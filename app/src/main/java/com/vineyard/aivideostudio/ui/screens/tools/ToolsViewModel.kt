@@ -323,7 +323,7 @@ class ToolsViewModel(
             statusText = "Extracting...", 
             statusColorHex = "#eab308"
         ) }
-        addLog("⚡ Starting IDM-style 10-stream parallel hardware frame extraction (10 frames/batch) at $targetFps FPS...", LogType.INFO)
+        addLog("⚡ Starting IDM-style 10-stream parallel hardware frame extraction (100 frames/batch) at $targetFps FPS...", LogType.INFO)
         startBackgroundKeepAlive("Extracting video frames in background...")
 
         extractionJob?.cancel()
@@ -1690,7 +1690,7 @@ class ToolsViewModel(
                 muxer.stop()
                 muxer.release()
             } catch (_: Exception) {}
-            extractor.release()
+                extractor.release()
         }
     }
 
