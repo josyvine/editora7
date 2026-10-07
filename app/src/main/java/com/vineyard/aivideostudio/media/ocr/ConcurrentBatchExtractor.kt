@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class ConcurrentBatchExtractor(
     private val maxConcurrentWorkers: Int = 10,
-    private val batchSize: Int = 10
+    private val batchSize: Int = 100
 ) {
 
     data class BatchChunk(
@@ -76,7 +76,7 @@ class ConcurrentBatchExtractor(
                             processedInBatch++
                         }
                         
-                        // Emit progress per batch (steps of 10) instead of frame-by-frame (+1)
+                        // Emit progress per batch (steps of 100) instead of frame-by-frame (+1)
                         if (processedInBatch > 0) {
                             val done = completedCounter.addAndGet(processedInBatch)
                             onProgress(done, total)
