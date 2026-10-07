@@ -55,6 +55,8 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.sin
@@ -327,44 +329,57 @@ class ToolsViewModel(
         extractionJob?.cancel()
         extractionJob = viewModelScope.launch(Dispatchers.Default) {
             try {
-                // Initialize the 10 worker task slots in state
+                val taskMap = ConcurrentHashMap<Int, ExtractionWorkerTask>()
+                val lastUiDispatchMs = AtomicLong(0L)
+
                 val extractedList = frameExtractor.extractFramesWithWorkers(
                     videoUri = uri,
                     targetFps = targetFps,
                     onInitWorkers = { initialTasks ->
-                        _uiState.update { state ->
-                            state.copy(
-                                workerTasks = initialTasks.map { t ->
-                                    ExtractionWorkerTask(
-                                        taskId = t.taskId,
-                                        startFrame = t.startFrame,
-                                        endFrame = t.endFrame,
-                                        completedFrames = 0,
-                                        totalFrames = t.totalFrames,
-                                        percent = 0
-                                    )
-                                }
+                        taskMap.clear()
+                        for (t in initialTasks) {
+                            taskMap[t.taskId] = ExtractionWorkerTask(
+                                taskId = t.taskId,
+                                startFrame = t.startFrame,
+                                endFrame = t.endFrame,
+                                completedFrames = 0,
+                                totalFrames = t.totalFrames,
+                                percent = 0
                             )
+                        }
+                        _uiState.update { state ->
+                            state.copy(workerTasks = taskMap.values.sortedBy { it.taskId })
                         }
                     },
                     onWorkerProgress = { taskId, doneInWorker, totalInWorker ->
-                        _uiState.update { state ->
-                            val updatedTasks = state.workerTasks.map { task ->
-                                if (task.taskId == taskId) {
-                                    val pct = if (totalInWorker > 0) {
-                                        ((doneInWorker.toFloat() / totalInWorker.toFloat()) * 100).toInt().coerceIn(0, 100)
-                                    } else 0
-                                    task.copy(completedFrames = doneInWorker, totalFrames = totalInWorker, percent = pct)
-                                } else task
+                        val existing = taskMap[taskId]
+                        if (existing != null) {
+                            val pct = if (totalInWorker > 0) {
+                                ((doneInWorker.toFloat() / totalInWorker.toFloat()) * 100).toInt().coerceIn(0, 100)
+                            } else 0
+                            taskMap[taskId] = existing.copy(
+                                completedFrames = doneInWorker,
+                                totalFrames = totalInWorker,
+                                percent = pct
+                            )
+                        }
+
+                        val now = System.currentTimeMillis()
+                        val last = lastUiDispatchMs.get()
+                        if (now - last > 80 || doneInWorker >= totalInWorker) {
+                            if (lastUiDispatchMs.compareAndSet(last, now)) {
+                                _uiState.update { state ->
+                                    state.copy(workerTasks = taskMap.values.sortedBy { it.taskId })
+                                }
                             }
-                            state.copy(workerTasks = updatedTasks)
                         }
                     },
                     onTotalProgress = { current, total ->
                         val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt().coerceIn(0, 100) else 0
                         _uiState.update { it.copy(
                             statusText = "Extracting $current/$total",
-                            progressPercent = pct
+                            progressPercent = pct,
+                            workerTasks = taskMap.values.sortedBy { it.taskId }
                         )}
                         updateBackgroundKeepAlive(current, total)
                     }
@@ -1675,7 +1690,7 @@ class ToolsViewModel(
                 muxer.stop()
                 muxer.release()
             } catch (_: Exception) {}
-                extractor.release()
+            extractor.release()
         }
     }
 
