@@ -31,6 +31,7 @@ import com.vineyard.aivideostudio.media.tools.NativeTimelineZipManager
 import com.vineyard.aivideostudio.media.tools.SpatialCluster
 import com.vineyard.aivideostudio.media.tools.SpatialClusterer
 import com.vineyard.aivideostudio.media.tools.TimeSlotSession
+import com.vineyard.aivideostudio.media.tools.ToolsBoundingBox
 import com.vineyard.aivideostudio.media.tools.ZipOcrFrame
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
 import com.vineyard.aivideostudio.media.video.FastNativeFrameExtractor
@@ -498,7 +499,7 @@ class ToolsViewModel(
 
                 // 2. Automatically run ultra-fast OCR on these extracted cue frames
                 _uiState.update { it.copy(statusText = "Scanning Text...", statusColorHex = "#eab308") }
-                val ocrBatch = ocrEngine.scanBatch(extractedList, parallelWorkers = 5) { _, _ -> }
+                val ocrBatch = ocrEngine.scanBatch(extractedList, roiMask = null, parallelWorkers = 5) { _, _ -> }
                 val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
                 updatedOcr.putAll(ocrBatch)
 
@@ -514,6 +515,9 @@ class ToolsViewModel(
                     )}
                     addLog("✅ Extracted & OCR scanned ${extractedList.size} cue frames in ~1 second.", LogType.SUCCESS)
                     seekToFrame(0)
+                    if (keyword.isNotEmpty()) {
+                        updateTargetClusters(keyword)
+                    }
                     evaluateHighlightMatches()
                 }
             } catch (e: Exception) {
@@ -778,7 +782,7 @@ class ToolsViewModel(
 
     fun addTargetRule(keyword: String, category: String, tool: String, clusterId: String = "all") {
         if (keyword.isBlank()) return
-        
+
         var clusterCenter: ClusterCenterPoint? = null
         if (clusterId != "all") {
             val selectedCluster = _uiState.value.detectedClusters.find { it.id.toString() == clusterId }
@@ -795,8 +799,12 @@ class ToolsViewModel(
             isZipSource = false,
             clusterCenter = clusterCenter
         )
-        
-        _uiState.update { it.copy(activeRules = it.activeRules + newRule) }
+
+        // Replace any existing rule for the exact same target text to avoid overlapping duplicates
+        val filteredRules = _uiState.value.activeRules.filter { 
+            !it.text.equals(keyword.trim(), ignoreCase = true) 
+        }
+        _uiState.update { it.copy(activeRules = filteredRules + newRule) }
 
         val state = _uiState.value
         val unscannedFrames = state.frames.filter { !state.extractedOcrData.containsKey(it.index) }
@@ -888,7 +896,7 @@ class ToolsViewModel(
                 for (rule in state.activeRules) {
                     val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, rule.text)
                     for (b in matches) {
-                        // If rule is anchored to a specific cluster location, filter by distance
+                        // If rule is anchored to a specific cluster location, filter strictly by distance
                         if (rule.clusterCenter != null) {
                             val dist = hypot(b.centerX - rule.clusterCenter.x, b.centerY - rule.clusterCenter.y)
                             if (dist > rule.clusterCenter.threshold) {
@@ -1899,4 +1907,3 @@ class ToolsViewModel(
         ocrEngine.close()
     }
 }
-
