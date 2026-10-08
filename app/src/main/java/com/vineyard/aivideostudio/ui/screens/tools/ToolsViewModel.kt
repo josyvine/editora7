@@ -389,7 +389,7 @@ class ToolsViewModel(
                         }
                     },
                     onTotalProgress = { current, total ->
-                        val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt().coerceIn(0, 100) else 0
+                        val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt() else 0
                         _uiState.update { it.copy(
                             statusText = "Extracting $current/$total",
                             progressPercent = pct,
@@ -427,7 +427,8 @@ class ToolsViewModel(
     }
 
     /**
-     * Extracts ONLY the selective frame range for the chosen Audio Cue and Keyword sub-timing.
+     * Extracts ONLY the selective frame range for the chosen Audio Cue and Keyword sub-timing,
+     * and automatically scans them with ML Kit OCR so highlights are ready immediately.
      */
     fun extractCueFrames() {
         val state = _uiState.value
@@ -475,6 +476,7 @@ class ToolsViewModel(
 
         viewModelScope.launch(Dispatchers.Default) {
             try {
+                // 1. Extract the selective frame range
                 val extractedList = frameExtractor.extractFrameRange(
                     videoUri = uri,
                     startFrame = startF,
@@ -489,17 +491,25 @@ class ToolsViewModel(
                     }
                 )
 
+                // 2. Automatically run ultra-fast OCR on these extracted cue frames
+                _uiState.update { it.copy(statusText = "Scanning Text...", statusColorHex = "#eab308") }
+                val ocrBatch = ocrEngine.scanBatch(extractedList, parallelWorkers = 5) { _, _ -> }
+                val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
+                updatedOcr.putAll(ocrBatch)
+
                 withContext(Dispatchers.Main) {
                     _uiState.update { it.copy(
                         frames = extractedList,
+                        extractedOcrData = updatedOcr,
                         currentFrameIndex = 0,
                         isProcessing = false,
                         statusText = "${extractedList.size} Cue Frames Ready",
                         statusColorHex = "#10b981",
                         progressPercent = 0
                     )}
-                    addLog("✅ Extracted ${extractedList.size} selective cue frames in ~1 second.", LogType.SUCCESS)
+                    addLog("✅ Extracted & OCR scanned ${extractedList.size} selective cue frames in ~1 second.", LogType.SUCCESS)
                     seekToFrame(0)
+                    evaluateHighlightMatches()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -670,6 +680,7 @@ class ToolsViewModel(
                     statusColorHex = "#10b981"
                 )}
                 updateExportedJsonState()
+                evaluateHighlightMatches()
             }
         }
     }
@@ -712,6 +723,7 @@ class ToolsViewModel(
                     )}
                     addLog("✅ Ultra-Fast OCR completed successfully.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
+                    evaluateHighlightMatches()
                     updateExportedJsonState()
                 }
             } catch (e: Exception) {
@@ -774,7 +786,33 @@ class ToolsViewModel(
         )
         
         _uiState.update { it.copy(activeRules = it.activeRules + newRule) }
-        evaluateHighlightMatches()
+
+        val state = _uiState.value
+        // If frames exist but haven't been OCR-scanned yet, run OCR immediately on them
+        val unscannedFrames = state.frames.filter { !state.extractedOcrData.containsKey(it.index) }
+        if (unscannedFrames.isNotEmpty()) {
+            _uiState.update { it.copy(statusText = "Scanning Text...", statusColorHex = "#eab308") }
+            viewModelScope.launch(Dispatchers.Default) {
+                val batchResults = ocrEngine.scanBatch(unscannedFrames, parallelWorkers = 5) { _, _ -> }
+                val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
+                updatedOcr.putAll(batchResults)
+
+                withContext(Dispatchers.Main) {
+                    _uiState.update { it.copy(extractedOcrData = updatedOcr) }
+                    evaluateHighlightMatches()
+                    val matchCount = _uiState.value.frames.count { it.isHighlightEnabled }
+                    _uiState.update { it.copy(
+                        statusText = if (matchCount > 0) "Locked: $matchCount Frames" else "Target Locked",
+                        statusColorHex = "#10b981"
+                    )}
+                    addLog("🎯 Target '$keyword' scanned and locked on $matchCount frames.", LogType.SUCCESS)
+                }
+            }
+        } else {
+            evaluateHighlightMatches()
+            val matchCount = _uiState.value.frames.count { it.isHighlightEnabled }
+            addLog("🎯 Target '$keyword' locked on $matchCount frames.", LogType.SUCCESS)
+        }
     }
 
     fun removeTargetRule(id: Long) {
@@ -793,6 +831,8 @@ class ToolsViewModel(
         if (state.activeRules.isEmpty()) return
 
         var unmarkedCount = 0
+        val blurMap = state.directBlurs.toMutableMap()
+
         val updatedFrames = state.frames.map { f ->
             val ocr = state.extractedOcrData[f.index]
             var hasExactMatch = false
@@ -809,6 +849,7 @@ class ToolsViewModel(
 
             if (!hasExactMatch && f.isHighlightEnabled) {
                 unmarkedCount++
+                blurMap.remove(f.index)
                 f.copy(isHighlightEnabled = false, hasMismatch = true)
             } else if (hasExactMatch) {
                 f.copy(isHighlightEnabled = true, hasMismatch = false)
@@ -817,28 +858,48 @@ class ToolsViewModel(
             }
         }
 
-        _uiState.update { it.copy(frames = updatedFrames) }
+        _uiState.update { it.copy(frames = updatedFrames, directBlurs = blurMap) }
         addLog("🧹 Discarded wrong highlights on $unmarkedCount non-matching frames.", LogType.INFO)
         updateExportedJsonState()
     }
 
     private fun evaluateHighlightMatches() {
         val state = _uiState.value
+        val blurMap = state.directBlurs.toMutableMap()
+
         val updatedFrames = state.frames.map { f ->
             val ocr = state.extractedOcrData[f.index]
             var hasMatch = false
+
             if (ocr != null) {
+                val frameBoxes = mutableListOf<DetectedTargetBox>()
                 for (rule in state.activeRules) {
                     val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, rule.text)
-                    if (matches.isNotEmpty()) {
+                    for (b in matches) {
                         hasMatch = true
-                        break
+                        frameBoxes.add(
+                            DetectedTargetBox(
+                                x0 = b.x0,
+                                y0 = b.y0,
+                                width = b.width,
+                                height = b.height,
+                                text = rule.text,
+                                tool = rule.tool,
+                                frame = f.index,
+                                time = f.timeSeconds
+                            )
+                        )
                     }
                 }
+                if (frameBoxes.isNotEmpty()) {
+                    blurMap[f.index] = frameBoxes
+                } else if (!state.activeRules.any { it.isZipSource }) {
+                    blurMap.remove(f.index)
+                }
             }
-            if (hasMatch) f.copy(isHighlightEnabled = true) else f
+            if (hasMatch) f.copy(isHighlightEnabled = true, hasMismatch = false) else f.copy(isHighlightEnabled = false)
         }
-        _uiState.update { it.copy(frames = updatedFrames) }
+        _uiState.update { it.copy(frames = updatedFrames, directBlurs = blurMap) }
         updateExportedJsonState()
     }
 
