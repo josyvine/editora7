@@ -36,6 +36,7 @@ import com.vineyard.aivideostudio.media.tools.ToolsBoundingBox
 import com.vineyard.aivideostudio.media.tools.ZipOcrFrame
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
 import com.vineyard.aivideostudio.media.video.FastNativeFrameExtractor
+import com.vineyard.aivideostudio.processing.logger.ProcessingLogger
 import com.vineyard.aivideostudio.processing.worker.VideoProcessingForegroundService
 import com.vineyard.aivideostudio.ui.screens.tools.components.NativeOverlayRenderer
 import kotlinx.coroutines.Dispatchers
@@ -256,12 +257,21 @@ class ToolsViewModel(
     }
 
     // =========================================================
-    // TERMINAL LOGGING
+    // TERMINAL LOGGING (CONNECTED TO GLOBAL SYSTEM LOG CONSOLE)
     // =========================================================
     fun addLog(message: String, type: LogType = LogType.INFO) {
         val timestamp = timeFormatter.format(Date())
         val newEntry = TerminalLogEntry("[$timestamp]", message, type)
         _uiState.update { it.copy(activeLogEntries = it.activeLogEntries + newEntry) }
+
+        // Forward to the global ProcessingLogger so the floating console is always connected
+        try {
+            when (type) {
+                LogType.ERROR -> ProcessingLogger.e("ToolsStudio", message)
+                LogType.WARNING -> ProcessingLogger.w("ToolsStudio", message)
+                else -> ProcessingLogger.i("ToolsStudio", message)
+            }
+        } catch (_: Exception) {}
     }
 
     fun clearLogs() {
@@ -1578,6 +1588,10 @@ class ToolsViewModel(
             val tempVideoFile = File(context.cacheDir, "temp_render_video.mp4")
             val tempFinalFile = File(context.cacheDir, "temp_render_final.mp4")
 
+            var streamRetriever: MediaMetadataRetriever? = null
+            var encoder: MediaCodec? = null
+            var videoMuxer: MediaMuxer? = null
+
             try {
                 // 1. Extract synchronized audio track from original video
                 var hasAudio = false
@@ -1585,10 +1599,10 @@ class ToolsViewModel(
                     extractAudioTrackNative(uri, tempAudioFile)
                     hasAudio = tempAudioFile.exists() && tempAudioFile.length() > 0
                 } catch (audioErr: Exception) {
-                    addLog("⚠️ Audio extract skipped: ${audioErr.message}", LogType.WARNING)
+                    addLog("⚠️ Audio extract notice: ${audioErr.message ?: "Skipping audio"}", LogType.WARNING)
                 }
 
-                // 2. Determine native dimensions and total video duration
+                // 2. Probe native dimensions and total video duration
                 val probeRetriever = MediaMetadataRetriever()
                 var rawW = state.videoWidth
                 var rawH = state.videoHeight
@@ -1615,7 +1629,7 @@ class ToolsViewModel(
 
                 val durationSec = durationMs / 1000f
                 val totalVideoFrames = if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size
-                if (totalVideoFrames <= 0) throw Exception("Could not determine total video frame count.")
+                if (totalVideoFrames <= 0) throw IllegalStateException("Could not determine total video frame count.")
 
                 // Combine all direct blurs and accumulated cue highlights across the entire video
                 val allHighlightsMap = state.accumulatedDirectBlurs.toMutableMap()
@@ -1628,12 +1642,13 @@ class ToolsViewModel(
                     setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 }
 
-                val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+                    configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                }
                 val inputSurface = encoder.createInputSurface()
                 encoder.start()
 
-                val videoMuxer = MediaMuxer(tempVideoFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                videoMuxer = MediaMuxer(tempVideoFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
                 var videoTrackIndex = -1
                 var muxerStarted = false
 
@@ -1641,10 +1656,9 @@ class ToolsViewModel(
                 val frameDurationUs = (1_000_000L / fps)
 
                 val workspaceDir = File(context.filesDir, "editora_frames_workspace")
-                val streamRetriever = MediaMetadataRetriever()
-                try {
-                    streamRetriever.setDataSource(context, uri)
-                } catch (_: Exception) {}
+                streamRetriever = MediaMetadataRetriever().apply {
+                    setDataSource(context, uri)
+                }
 
                 val destRect = Rect(0, 0, outWidth, outHeight)
 
@@ -1669,10 +1683,8 @@ class ToolsViewModel(
 
                     if (surfaceCanvas != null) {
                         try {
-                            // Draw base video frame scaled 100% to fill the encoder canvas
                             surfaceCanvas.drawBitmap(frameBitmap, null, destRect, null)
 
-                            // Burn overlays for this frame if any cue edit targeted it
                             val boxes = allHighlightsMap[i] ?: emptyList()
                             for (box in boxes) {
                                 val scaleX = outWidth.toFloat() / (if (rawW > 0) rawW.toFloat() else outWidth.toFloat())
@@ -1701,21 +1713,26 @@ class ToolsViewModel(
 
                     frameBitmap.recycle()
 
-                    var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
-                    while (outIndex >= 0) {
-                        val encodedData = encoder.getOutputBuffer(outIndex)
-                        if (encodedData != null) {
+                    // Drain encoder output buffers properly handling INFO_OUTPUT_FORMAT_CHANGED
+                    while (true) {
+                        val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 2500)
+                        if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             if (!muxerStarted) {
-                                val newFormat = encoder.outputFormat
-                                videoTrackIndex = videoMuxer.addTrack(newFormat)
+                                videoTrackIndex = videoMuxer.addTrack(encoder.outputFormat)
                                 videoMuxer.start()
                                 muxerStarted = true
                             }
-                            bufferInfo.presentationTimeUs = ptsUs
-                            videoMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                        } else if (outIndex >= 0) {
+                            if (muxerStarted && bufferInfo.size > 0) {
+                                val encodedData = encoder.getOutputBuffer(outIndex)
+                                if (encodedData != null) {
+                                    videoMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                                }
+                            }
+                            encoder.releaseOutputBuffer(outIndex, false)
+                        } else {
+                            break
                         }
-                        encoder.releaseOutputBuffer(outIndex, false)
-                        outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
                     }
 
                     val pct = (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 100).toInt()
@@ -1726,27 +1743,38 @@ class ToolsViewModel(
                     updateBackgroundKeepAlive(i + 1, totalVideoFrames)
                 }
 
-                try { streamRetriever.release() } catch (_: Exception) {}
-
+                // Final EOS drain
                 encoder.signalEndOfInputStream()
-                var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 20000)
-                while (outIndex >= 0) {
-                    val encodedData = encoder.getOutputBuffer(outIndex)
-                    if (encodedData != null && muxerStarted) {
-                        videoMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                while (true) {
+                    val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
+                    if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        if (!muxerStarted) {
+                            videoTrackIndex = videoMuxer.addTrack(encoder.outputFormat)
+                            videoMuxer.start()
+                            muxerStarted = true
+                        }
+                    } else if (outIndex >= 0) {
+                        if (muxerStarted && bufferInfo.size > 0) {
+                            val encodedData = encoder.getOutputBuffer(outIndex)
+                            if (encodedData != null) {
+                                videoMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                            }
+                        }
+                        encoder.releaseOutputBuffer(outIndex, false)
+                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                    } else {
+                        break
                     }
-                    encoder.releaseOutputBuffer(outIndex, false)
-                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
-                    outIndex = encoder.dequeueOutputBuffer(bufferInfo, 20000)
                 }
 
-                encoder.stop()
-                encoder.release()
-                inputSurface.release()
+                try { encoder.stop() } catch (_: Exception) {}
+                try { encoder.release() } catch (_: Exception) {}
+                encoder = null
 
                 if (muxerStarted) {
-                    videoMuxer.stop()
-                    videoMuxer.release()
+                    try { videoMuxer.stop() } catch (_: Exception) {}
+                    try { videoMuxer.release() } catch (_: Exception) {}
+                    videoMuxer = null
                 }
 
                 val finalExportFile = if (hasAudio && tempVideoFile.exists()) {
@@ -1767,23 +1795,30 @@ class ToolsViewModel(
                         statusText = "Full Video Downloaded",
                         statusColorHex = "#10b981"
                     )}
-                    addLog("🎉 SUCCESS: Full 4.5m video rendered with all accumulated cue highlights and synchronized audio.", LogType.SUCCESS)
+                    addLog("🎉 SUCCESS: Full video rendered with all accumulated cue highlights and audio.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
                 }
 
             } catch (e: Exception) {
                 e.printStackTrace()
+                val errorName = e.javaClass.simpleName
+                val errorMsg = e.message ?: e.cause?.message ?: "Native MediaPipeline fault"
+                val topStack = e.stackTrace.firstOrNull()?.let { " (${it.fileName}:${it.lineNumber})" } ?: ""
+
                 withContext(Dispatchers.Main) {
-                    addLog("❌ Render Video Error: ${e.message}", LogType.ERROR)
+                    addLog("❌ Render Video Error: $errorName: $errorMsg$topStack", LogType.ERROR)
                     _uiState.update { it.copy(
                         isRendering = false,
-                        renderProgressStatus = "Render Failed: ${e.message}",
+                        renderProgressStatus = "Render Failed: $errorMsg",
                         statusText = "Render Failed",
                         statusColorHex = "#ef4444"
                     )}
                     stopBackgroundKeepAlive()
                 }
             } finally {
+                try { streamRetriever?.release() } catch (_: Exception) {}
+                try { encoder?.release() } catch (_: Exception) {}
+                try { videoMuxer?.release() } catch (_: Exception) {}
                 tempAudioFile.delete()
                 tempVideoFile.delete()
                 tempFinalFile.delete()
