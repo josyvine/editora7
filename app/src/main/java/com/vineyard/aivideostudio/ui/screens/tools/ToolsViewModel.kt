@@ -497,7 +497,7 @@ class ToolsViewModel(
                     }
                 )
 
-                // 2. Automatically run ultra-fast OCR on these extracted cue frames
+                // 2. Automatically run ultra-fast initial OCR to detect anchor
                 _uiState.update { it.copy(statusText = "Scanning Text...", statusColorHex = "#eab308") }
                 val ocrBatch = ocrEngine.scanBatch(extractedList, roiMask = null, parallelWorkers = 5) { _, _ -> }
                 val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
@@ -716,7 +716,7 @@ class ToolsViewModel(
 
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                val batchResults = ocrEngine.scanBatch(framesToScan, parallelWorkers = 5) { current, total ->
+                val batchResults = ocrEngine.scanBatch(framesToScan, roiMask = null, parallelWorkers = 5) { current, total ->
                     val pct = ((current.toFloat() / total.toFloat()) * 100).toInt()
                     _uiState.update { it.copy(
                         statusText = "OCR: $current/$total",
@@ -780,6 +780,11 @@ class ToolsViewModel(
         _uiState.update { it.copy(detectedClusters = clusters) }
     }
 
+    /**
+     * Programmatic Target Locking with Automated Black Screen Mask (Zero Drag):
+     * Locates the exact target phrase on screen, programmatically applies an ROI mask
+     * to blackout all surrounding headers and unrelated elements, and locks pulsing brackets.
+     */
     fun addTargetRule(keyword: String, category: String, tool: String, clusterId: String = "all") {
         if (keyword.isBlank()) return
 
@@ -800,18 +805,41 @@ class ToolsViewModel(
             clusterCenter = clusterCenter
         )
 
-        // Replace any existing rule for the exact same target text to avoid overlapping duplicates
-        val filteredRules = _uiState.value.activeRules.filter { 
-            !it.text.equals(keyword.trim(), ignoreCase = true) 
-        }
-        _uiState.update { it.copy(activeRules = filteredRules + newRule) }
+        // Enforce single active target rule to prevent overlapping duplicates
+        _uiState.update { it.copy(activeRules = listOf(newRule)) }
 
         val state = _uiState.value
-        val unscannedFrames = state.frames.filter { !state.extractedOcrData.containsKey(it.index) }
-        if (unscannedFrames.isNotEmpty()) {
-            _uiState.update { it.copy(statusText = "Scanning Text...", statusColorHex = "#eab308") }
+        if (state.frames.isNotEmpty()) {
+            _uiState.update { it.copy(statusText = "Locking Target Mask...", statusColorHex = "#eab308") }
+            
             viewModelScope.launch(Dispatchers.Default) {
-                val batchResults = ocrEngine.scanBatch(unscannedFrames, parallelWorkers = 5) { _, _ -> }
+                // Pass 1: Initial scan to find the exact target coordinates on the anchor frame
+                val firstFrame = state.frames.first()
+                val anchorOcr = ocrEngine.scanFrame(firstFrame, roiMask = null)
+                val targetMatches = SpatialClusterer.findMatchingBoundingBoxes(anchorOcr.lines, keyword)
+                
+                val bestBox: ToolsBoundingBox? = if (clusterCenter != null) {
+                    targetMatches.find { hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold }
+                        ?: targetMatches.firstOrNull()
+                } else {
+                    targetMatches.firstOrNull()
+                }
+
+                // Pass 2: Programmatic Blackout Mask (Zero Drag)
+                // Cuts out ONLY the target box (+ padding) and blacks out 100% of the surrounding screen
+                val autoRoiMask: ToolsBoundingBox? = if (bestBox != null) {
+                    val padX = 40f
+                    val padY = 25f
+                    ToolsBoundingBox(
+                        x0 = maxOf(0f, bestBox.x0 - padX),
+                        y0 = maxOf(0f, bestBox.y0 - padY),
+                        width = bestBox.width + (padX * 2f),
+                        height = bestBox.height + (padY * 2f)
+                    )
+                } else null
+
+                // Run batch scan with automated ROI mask in memory
+                val batchResults = ocrEngine.scanBatch(state.frames, roiMask = autoRoiMask, parallelWorkers = 5) { _, _ -> }
                 val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
                 updatedOcr.putAll(batchResults)
 
@@ -824,14 +852,12 @@ class ToolsViewModel(
                         statusText = if (matchCount > 0) "Locked: $matchCount Frames" else "Target Locked",
                         statusColorHex = "#10b981"
                     )}
-                    addLog("🎯 Target '$keyword' scanned and locked on $matchCount frames.", LogType.SUCCESS)
+                    addLog("🎯 Target '$keyword' masked & locked on $matchCount frames with pixel precision.", LogType.SUCCESS)
                 }
             }
         } else {
-            updateTargetClusters(keyword)
             evaluateHighlightMatches()
-            val matchCount = _uiState.value.frames.count { it.isHighlightEnabled }
-            addLog("🎯 Target '$keyword' locked on $matchCount frames.", LogType.SUCCESS)
+            addLog("🎯 Target '$keyword' registered.", LogType.SUCCESS)
         }
     }
 
