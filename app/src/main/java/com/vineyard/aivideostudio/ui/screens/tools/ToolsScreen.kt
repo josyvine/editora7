@@ -179,6 +179,12 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         uri?.let { viewModel.setVideoUri(it) }
     }
 
+    val externalTranscriptPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { viewModel.loadExternalTranscriptFile(it) }
+    }
+
     // 1. VIDEO PLAYER & CONTROLS
     Card(
         colors = CardDefaults.cardColors(containerColor = Color.Black),
@@ -248,7 +254,10 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                         withArrow = state.isArrowPointerEnabled
                     )
                 } else {
-                    Text("No Video Loaded", color = BorderColor)
+                    Text(
+                        text = if (state.videoUri != null) "Ready to Play (Tap Play)" else "No Video Loaded",
+                        color = BorderColor
+                    )
                 }
             }
 
@@ -290,6 +299,49 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                     .background(SurfaceDark)
                     .padding(10.dp)
             ) {
+                // Mode Selection Dropdown Row (Normal vs Cue)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Workflow Mode:",
+                        color = Color.LightGray,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    var modeExpanded by remember { mutableStateOf(false) }
+                    Box {
+                        OutlinedButton(
+                            onClick = { modeExpanded = true },
+                            shape = RoundedCornerShape(6.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            border = BorderStroke(1.dp, if (state.studioMode == "Cue") PurpleAccent else AccentBlue),
+                            colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF1E1B4B))
+                        ) {
+                            Text(
+                                text = if (state.studioMode == "Cue") "🎯 Cue Mode (Selective)" else "⚡ Normal Mode (All)",
+                                color = if (state.studioMode == "Cue") PurpleAccent else AccentBlue,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        DropdownMenu(expanded = modeExpanded, onDismissRequest = { modeExpanded = false }) {
+                            DropdownMenuItem(
+                                text = { Text("⚡ Normal Mode (Full Video Extraction)") },
+                                onClick = { viewModel.setStudioMode("Normal"); modeExpanded = false }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("🎯 Cue Mode (Instant Play & Selective Frames)") },
+                                onClick = { viewModel.setStudioMode("Cue"); modeExpanded = false }
+                            )
+                        }
+                    }
+                }
+
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Slider(
                         value = state.currentFrameIndex.toFloat(),
@@ -392,7 +444,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         }
     }
 
-    // 2. VIDEO UPLOAD & EXTRACTION CONTROLS + IDM 10-STREAM PROGRESS CONTAINER
+    // 2. VIDEO UPLOAD & MODE-SPECIFIC EXTRACTION CONTROLS
     Card(
         colors = CardDefaults.cardColors(containerColor = SurfaceDark),
         shape = RoundedCornerShape(10.dp),
@@ -416,68 +468,180 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
 
             if (state.videoUri != null) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    var fpsExpanded by remember { mutableStateOf(false) }
-                    var selectedFps by remember { mutableIntStateOf(12) }
 
-                    Box(modifier = Modifier.weight(1f)) {
-                        OutlinedButton(
-                            onClick = { fpsExpanded = true },
-                            shape = RoundedCornerShape(6.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("$selectedFps FPS", color = Color.White, fontSize = 12.sp)
-                        }
-                        DropdownMenu(expanded = fpsExpanded, onDismissRequest = { fpsExpanded = false }) {
-                            listOf(1, 2, 4, 6, 10, 12).forEach { fps ->
-                                DropdownMenuItem(
-                                    text = { Text("$fps FPS ${if (fps == 12) "(Original)" else ""}") },
-                                    onClick = { selectedFps = fps; fpsExpanded = false }
+                if (state.studioMode == "Cue") {
+                    // =========================================================
+                    // CUE MODE: 3 CONTROLS (DROPDOWN + KEYWORD BOX + EXTRACT CUE)
+                    // =========================================================
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF0C1322)),
+                        border = BorderStroke(1.dp, PurpleAccent),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(Modifier.padding(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("🎙️ Audio Cue Sync (Selective Frames)", color = PurpleAccent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                if (state.transcriptCues.isEmpty()) {
+                                    Text(
+                                        text = "+ Load SRT / VTT",
+                                        color = AccentBlue,
+                                        fontSize = 10.sp,
+                                        modifier = Modifier.clickable { externalTranscriptPicker.launch("*/*") }
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            if (state.detectedAudioCues.isEmpty()) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Button(
+                                        onClick = { viewModel.transcribeAudioWithGemini(state.geminiApiKey, state.selectedGeminiModel) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = SuccessGreen),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("🎙️ Transcribe with Gemini AI", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                    Button(
+                                        onClick = { externalTranscriptPicker.launch("*/*") },
+                                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.weight(0.9f)
+                                    ) {
+                                        Text("📂 Load SRT", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            } else {
+                                // CONTROL 1: TRANSCRIPTION DROPDOWN
+                                var cueExpanded by remember { mutableStateOf(false) }
+                                val activeCue = state.detectedAudioCues.find { it.id.toString() == state.selectedAudioCueId }
+                                    ?: state.detectedAudioCues.firstOrNull()
+
+                                Box(modifier = Modifier.fillMaxWidth()) {
+                                    OutlinedButton(
+                                        onClick = { cueExpanded = true },
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.fillMaxWidth(),
+                                        border = BorderStroke(1.dp, PurpleAccent),
+                                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF1E1B4B))
+                                    ) {
+                                        Text(
+                                            text = activeCue?.let { "[${it.startTime}s - ${it.endTime}s] \"${it.snippet}\"" } ?: "Select Dialogue Segment",
+                                            color = Color.White, fontSize = 11.sp, maxLines = 1
+                                        )
+                                    }
+                                    DropdownMenu(expanded = cueExpanded, onDismissRequest = { cueExpanded = false }) {
+                                        state.detectedAudioCues.forEach { cue ->
+                                            DropdownMenuItem(
+                                                text = { Text("[${cue.startTime}s - ${cue.endTime}s] \"${cue.snippet}\" (Fr ${cue.startFrame}-${cue.endFrame})") },
+                                                onClick = {
+                                                    viewModel.setAudioCueFilter(cue.id.toString())
+                                                    cueExpanded = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(6.dp))
+
+                                // CONTROL 2: KEYWORD INPUT BOX (Sub-timing Precision)
+                                OutlinedTextField(
+                                    value = state.cueKeyword,
+                                    onValueChange = { viewModel.setCueKeyword(it) },
+                                    placeholder = { Text("Keyword within dialogue (e.g. 'unlimited daily requests')") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    singleLine = true,
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        unfocusedContainerColor = BgDark, focusedContainerColor = BgDark,
+                                        unfocusedBorderColor = BorderColor, focusedBorderColor = WarningYellow
+                                    )
                                 )
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                Button(
+                                    onClick = { viewModel.extractCueFrames() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = PurpleAccent),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("⚡ Extract Cue Frames (~1s)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
                             }
                         }
                     }
+                } else {
+                    // =========================================================
+                    // NORMAL MODE: EXTRACT ALL & 10-STREAM IDM CONTAINER
+                    // =========================================================
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        var fpsExpanded by remember { mutableStateOf(false) }
+                        var selectedFps by remember { mutableIntStateOf(12) }
 
-                    Button(
-                        onClick = { viewModel.extractAllFrames(selectedFps) },
-                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                        shape = RoundedCornerShape(6.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Extract All", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    }
-                }
+                        Box(modifier = Modifier.weight(1f)) {
+                            OutlinedButton(
+                                onClick = { fpsExpanded = true },
+                                shape = RoundedCornerShape(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("$selectedFps FPS", color = Color.White, fontSize = 12.sp)
+                            }
+                            DropdownMenu(expanded = fpsExpanded, onDismissRequest = { fpsExpanded = false }) {
+                                listOf(1, 2, 4, 6, 10, 12).forEach { fps ->
+                                    DropdownMenuItem(
+                                        text = { Text("$fps FPS ${if (fps == 12) "(Original)" else ""}") },
+                                        onClick = { selectedFps = fps; fpsExpanded = false }
+                                    )
+                                }
+                            }
+                        }
 
-                // IDM-STYLE MULTI-STREAM PROGRESS BARS CONTAINER (UP TO 10 PARALLEL TASKS)
-                if (state.isProcessing && state.workerTasks.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF090E1A))
-                            .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(8.dp))
-                            .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                        Button(
+                            onClick = { viewModel.extractAllFrames(selectedFps) },
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.weight(1f)
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
-                                Text("IDM 10-Stream Parallel Extractor (100 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                            }
-                            Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text("Extract All", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         }
+                    }
 
-                        // 10 Individual Worker Progress Bars in a Smooth Scrollable Column
+                    // IDM-STYLE MULTI-STREAM PROGRESS BARS CONTAINER (UP TO 10 PARALLEL TASKS)
+                    if (state.isProcessing && state.workerTasks.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(10.dp))
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 240.dp)
-                                .verticalScroll(rememberScrollState()),
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFF090E1A))
+                                .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(8.dp))
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
+                                    Text("IDM 10-Stream Parallel Extractor (100 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                }
+                                Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+
+                            // 10 Individual Worker Progress Bars in a Smooth Scrollable Column
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 240.dp)
+                                    .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             state.workerTasks.forEach { task ->
@@ -515,7 +679,6 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                         }
                     }
                 } else if (state.isProcessing && state.progressPercent > 0) {
-                    // Fallback Single Master Progress Bar
                     Spacer(modifier = Modifier.height(6.dp))
                     LinearProgressIndicator(
                         progress = { state.progressPercent / 100f },
@@ -530,6 +693,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
             }
         }
     }
+}
 
     // 3. TIMELINE FILMSTRIP
     if (state.frames.isNotEmpty()) {
@@ -581,7 +745,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         }
     }
 
-    // 4. TARGET PANEL & RULES CARD
+    // 4. TARGET PANEL & RULES CARD (CONTROL 3: TARGET WORD INPUT BOX)
     Card(
         colors = CardDefaults.cardColors(containerColor = SurfaceDark),
         shape = RoundedCornerShape(10.dp),
@@ -603,7 +767,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                     keyword = it 
                     viewModel.updateTargetClusters(it)
                 },
-                placeholder = { Text("Target word (e.g. Playground, Dashboard, Email)") },
+                placeholder = { Text("Target word on screen (e.g. Playground, Dashboard, Email)") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 colors = OutlinedTextFieldDefaults.colors(
@@ -797,7 +961,6 @@ private fun FrameThumbnail(frame: ExtractedFrame, isActive: Boolean, onToggle: (
             Text("${frame.timeFormatted}s", color = Color.White, fontSize = 9.sp)
         }
         
-        // Interactive Toggle Badge
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -1396,7 +1559,7 @@ private fun TerminalConsole(viewModel: ToolsViewModel, state: ToolsUiState) {
 
 // =========================================================================
 // TAB 3: RENDER VIDEO WITH REAL-TIME PROGRESS BAR
-// =========================================================
+// =========================================================================
 @Composable
 private fun RenderVideoTab(viewModel: ToolsViewModel, state: ToolsUiState) {
     Card(
