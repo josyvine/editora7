@@ -59,26 +59,26 @@ fun ToolsOverlayPreview(
         val offsetX = (canvasWidth - destWidth) / 2f
         val offsetY = (canvasHeight - destHeight) / 2f
 
-        // 1. Draw base video frame
+        // 1. Draw base video frame centered with aspect-fit
         drawImage(
             image = baseBitmap.asImageBitmap(),
             dstOffset = IntOffset(offsetX.roundToInt(), offsetY.roundToInt()),
             dstSize = IntSize(destWidth.roundToInt(), destHeight.roundToInt())
         )
 
-        // Determine reference coordinate space so boxes never scale off-screen
-        val actualRefW = if (srcWidth >= 400f) srcWidth else if (refWidth > 0f) refWidth else 1080f
-        val actualRefH = if (srcHeight >= 400f) srcHeight else if (refHeight > 0f) refHeight else 2400f
+        // Determine reference coordinate space from the actual image dimensions
+        val actualRefW = if (refWidth > 0f) refWidth else srcWidth
+        val actualRefH = if (refHeight > 0f) refHeight else srcHeight
 
-        // 2. Draw active tool overlays scaled to destination dimensions
+        val coordScaleX = destWidth / actualRefW
+        val coordScaleY = destHeight / actualRefH
+
+        // 2. Draw active tool overlays with true aspect-fit projection
         for (box in activeBoxes) {
-            val scaleX = destWidth / actualRefW
-            val scaleY = destHeight / actualRefH
-
-            val scaledX = offsetX + (box.x0 * scaleX)
-            val scaledY = offsetY + (box.y0 * scaleY)
-            val scaledW = box.width * scaleX
-            val scaledH = box.height * scaleY
+            val scaledX = offsetX + (box.x0 * coordScaleX)
+            val scaledY = offsetY + (box.y0 * coordScaleY)
+            val scaledW = box.width * coordScaleX
+            val scaledH = box.height * coordScaleY
 
             NativeOverlayRenderer.drawToolOnDrawScope(
                 drawScope = this,
@@ -102,7 +102,6 @@ fun ToolsOverlayPreview(
  */
 object NativeOverlayRenderer {
 
-    // Preset color definitions
     val AmberGlow = Color(0xFFF59E0B)
     val AmberBright = Color(0xFFFEF08A)
     val CyanAccent = Color(0xFF38BDF8)
@@ -241,10 +240,14 @@ object NativeOverlayRenderer {
 
                 val len = min(bw, bh) * 0.28f
                 val bracketPath = Path().apply {
+                    // Top-Left Corner
                     moveTo(bx, by + len); lineTo(bx, by); lineTo(bx + len, by)
+                    // Top-Right Corner
                     moveTo(bx + bw - len, by); lineTo(bx + bw, by); lineTo(bx + bw, by + len)
-                    moveTo(bx + by + bh - len, by + bh); lineTo(bx, by + bh); lineTo(bx + len, by + bh)
-                    moveTo(bx + bw - len, by + bh); lineTo(bx + bw, by + bh); lineTo(bx + bw, by + bh - len)
+                    // Bottom-Left Corner
+                    moveTo(bx, by + bh - len); lineTo(bx, by + bh); lineTo(bx + len, by + bh)
+                    // Bottom-Right Corner
+                    moveTo(bx + bw, by + bh - len); lineTo(bx + bw, by + bh); lineTo(bx + bw - len, by + bh)
                 }
 
                 drawScope.drawPath(
@@ -489,10 +492,14 @@ object NativeOverlayRenderer {
 
                 val len = min(bw, bh) * 0.28f
                 val path = AndroidPath().apply {
+                    // Top-Left Corner
                     moveTo(bx, by + len); lineTo(bx, by); lineTo(bx + len, by)
+                    // Top-Right Corner
                     moveTo(bx + bw - len, by); lineTo(bx + bw, by); lineTo(bx + bw, by + len)
+                    // Bottom-Left Corner
                     moveTo(bx, by + bh - len); lineTo(bx, by + bh); lineTo(bx + len, by + bh)
-                    moveTo(bx + bw - len, by + bh); lineTo(bx + bw, by + bh); lineTo(bx + bw, by + bh - len)
+                    // Bottom-Right Corner
+                    moveTo(bx + bw, by + bh - len); lineTo(bx + bw, by + bh); lineTo(bx + bw - len, by + bh)
                 }
                 paint.color = android.graphics.Color.parseColor("#FFFEF08A")
                 paint.strokeWidth = 4f
