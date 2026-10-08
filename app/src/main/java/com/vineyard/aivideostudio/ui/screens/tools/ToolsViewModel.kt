@@ -20,6 +20,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.vineyard.aivideostudio.data.preferences.GeminiPreferences
@@ -36,7 +37,6 @@ import com.vineyard.aivideostudio.media.tools.ToolsBoundingBox
 import com.vineyard.aivideostudio.media.tools.ZipOcrFrame
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
 import com.vineyard.aivideostudio.media.video.FastNativeFrameExtractor
-import com.vineyard.aivideostudio.processing.logger.ProcessingLogger
 import com.vineyard.aivideostudio.processing.worker.VideoProcessingForegroundService
 import com.vineyard.aivideostudio.ui.screens.tools.components.NativeOverlayRenderer
 import kotlinx.coroutines.Dispatchers
@@ -257,19 +257,18 @@ class ToolsViewModel(
     }
 
     // =========================================================
-    // TERMINAL LOGGING (CONNECTED TO GLOBAL SYSTEM LOG CONSOLE)
+    // TERMINAL LOGGING (CONNECTED TO ANDROID LOGCAT)
     // =========================================================
     fun addLog(message: String, type: LogType = LogType.INFO) {
         val timestamp = timeFormatter.format(Date())
         val newEntry = TerminalLogEntry("[$timestamp]", message, type)
         _uiState.update { it.copy(activeLogEntries = it.activeLogEntries + newEntry) }
 
-        // Forward to the global ProcessingLogger so the floating console is always connected
         try {
             when (type) {
-                LogType.ERROR -> ProcessingLogger.e("ToolsStudio", message)
-                LogType.WARNING -> ProcessingLogger.w("ToolsStudio", message)
-                else -> ProcessingLogger.i("ToolsStudio", message)
+                LogType.ERROR -> Log.e("ToolsStudio", message)
+                LogType.WARNING -> Log.w("ToolsStudio", message)
+                else -> Log.i("ToolsStudio", message)
             }
         } catch (_: Exception) {}
     }
@@ -1683,6 +1682,7 @@ class ToolsViewModel(
 
                     if (surfaceCanvas != null) {
                         try {
+                            // Draw base video frame scaled 100% to fill the encoder canvas
                             surfaceCanvas.drawBitmap(frameBitmap, null, destRect, null)
 
                             val boxes = allHighlightsMap[i] ?: emptyList()
