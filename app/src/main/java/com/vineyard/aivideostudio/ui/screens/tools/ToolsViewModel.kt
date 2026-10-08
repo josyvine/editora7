@@ -59,6 +59,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.hypot
 import kotlin.math.sin
 
 enum class LogType { INFO, SUCCESS, WARNING, ERROR, NET }
@@ -427,8 +428,8 @@ class ToolsViewModel(
     }
 
     /**
-     * Extracts ONLY the selective frame range for the chosen Audio Cue and Keyword sub-timing,
-     * and automatically scans them with ML Kit OCR so highlights are ready immediately.
+     * Extracts the complete audio cue window with lead/trail padding,
+     * guaranteeing that the entire visual action is preserved without cutting off the beginning.
      */
     fun extractCueFrames() {
         val state = _uiState.value
@@ -443,30 +444,15 @@ class ToolsViewModel(
         }
 
         val fps = state.targetFps
-        val keyword = state.cueKeyword.trim()
-        val fullText = cue.snippet
+        
+        // Universal Rule: Always preserve the full cue start and end with 0.3s padding
+        // so visual clicks and cursor motions are never cut off.
+        val bufferFrames = maxOf(3, (0.3f * fps).toInt())
+        val startF = maxOf(0, cue.startFrame - bufferFrames)
+        val endF = cue.endFrame + bufferFrames
+        val totalCueFrames = endF - startF + 1
 
-        var startF = cue.startFrame
-        var endF = cue.endFrame
-
-        // Sub-timing precision calculation when keyword box has text
-        if (keyword.isNotEmpty() && fullText.contains(keyword, ignoreCase = true)) {
-            val startCharIdx = fullText.indexOf(keyword, ignoreCase = true)
-            val endCharIdx = startCharIdx + keyword.length
-            val totalChars = fullText.length.coerceAtLeast(1)
-
-            val cueDuration = (cue.endFrame - cue.startFrame).toFloat() / fps
-            val cueStartSec = cue.startFrame.toFloat() / fps
-
-            val subStartSec = (cueStartSec + (startCharIdx.toFloat() / totalChars) * cueDuration - 0.3f).coerceAtLeast(0f)
-            val subEndSec = (cueStartSec + (endCharIdx.toFloat() / totalChars) * cueDuration + 0.3f)
-
-            startF = floor(subStartSec * fps).toInt().coerceAtLeast(0)
-            endF = ceil(subEndSec * fps).toInt().coerceAtLeast(startF + 1)
-            addLog("🎯 Keyword '$keyword' narrowed dialogue window to Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
-        } else {
-            addLog("🎯 Using full dialogue cue window: Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
-        }
+        addLog("🎯 Extracting full cue window: Fr $startF - $endF (~$totalCueFrames frames).", LogType.INFO)
 
         _uiState.update { it.copy(
             isProcessing = true,
@@ -507,7 +493,7 @@ class ToolsViewModel(
                         statusColorHex = "#10b981",
                         progressPercent = 0
                     )}
-                    addLog("✅ Extracted & OCR scanned ${extractedList.size} selective cue frames in ~1 second.", LogType.SUCCESS)
+                    addLog("✅ Extracted & OCR scanned ${extractedList.size} cue frames in ~1 second.", LogType.SUCCESS)
                     seekToFrame(0)
                     evaluateHighlightMatches()
                 }
@@ -788,7 +774,6 @@ class ToolsViewModel(
         _uiState.update { it.copy(activeRules = it.activeRules + newRule) }
 
         val state = _uiState.value
-        // If frames exist but haven't been OCR-scanned yet, run OCR immediately on them
         val unscannedFrames = state.frames.filter { !state.extractedOcrData.containsKey(it.index) }
         if (unscannedFrames.isNotEmpty()) {
             _uiState.update { it.copy(statusText = "Scanning Text...", statusColorHex = "#eab308") }
@@ -799,6 +784,7 @@ class ToolsViewModel(
 
                 withContext(Dispatchers.Main) {
                     _uiState.update { it.copy(extractedOcrData = updatedOcr) }
+                    updateTargetClusters(keyword)
                     evaluateHighlightMatches()
                     val matchCount = _uiState.value.frames.count { it.isHighlightEnabled }
                     _uiState.update { it.copy(
@@ -809,6 +795,7 @@ class ToolsViewModel(
                 }
             }
         } else {
+            updateTargetClusters(keyword)
             evaluateHighlightMatches()
             val matchCount = _uiState.value.frames.count { it.isHighlightEnabled }
             addLog("🎯 Target '$keyword' locked on $matchCount frames.", LogType.SUCCESS)
@@ -876,6 +863,14 @@ class ToolsViewModel(
                 for (rule in state.activeRules) {
                     val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, rule.text)
                     for (b in matches) {
+                        // If rule is anchored to a specific cluster location, filter by distance
+                        if (rule.clusterCenter != null) {
+                            val dist = hypot(b.centerX - rule.clusterCenter.x, b.centerY - rule.clusterCenter.y)
+                            if (dist > rule.clusterCenter.threshold) {
+                                continue
+                            }
+                        }
+
                         hasMatch = true
                         frameBoxes.add(
                             DetectedTargetBox(
