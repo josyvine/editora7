@@ -67,7 +67,7 @@ data class TimeSlotSession(
 
 /**
  * High-performance native spatial clustering & timeline windowing engine.
- * Matches exact Euclidean threshold math and hierarchical filtering from the HTML studio.
+ * Uses exact Euclidean threshold math and universal length-agnostic token-span coordinate matching.
  */
 object SpatialClusterer {
 
@@ -96,7 +96,6 @@ object SpatialClusterer {
     ): List<SpatialCluster> {
         if (boxes.isEmpty()) return emptyList()
 
-        // Adapt coordinate envelope to the actual coordinate space of detected boxes
         val maxBoxX = boxes.maxOfOrNull { it.x0 + it.width } ?: 1080f
         val maxBoxY = boxes.maxOfOrNull { it.y0 + it.height } ?: 2400f
         val effectiveWidth = max(videoWidth.toFloat(), maxBoxX).coerceAtLeast(100f)
@@ -228,42 +227,113 @@ object SpatialClusterer {
     }
 
     /**
-     * Merges adjacent word-level bounding boxes that match a multi-word target string.
+     * Universal Length-Agnostic Coordinate Matcher:
+     * Handles single words ("playground"), multi-word phrases ("all models"),
+     * domains ("aistudio.google.com"), and arbitrary sentences (5 to 50+ words).
+     *
+     * Finds the exact contiguous sequence of tokens in each line and merges
+     * their coordinates into a single unified bounding box.
      */
     fun findMatchingBoundingBoxes(
         lines: List<OcrLineData>,
         query: String
     ): List<ToolsBoundingBox> {
         if (lines.isEmpty() || query.isBlank()) return emptyList()
+
         val cleanQuery = clean(query)
-        val cleanUser = clean(query.substringBefore("@"))
+        if (cleanQuery.isEmpty()) return emptyList()
+
+        val queryTokens = query.trim()
+            .split(Regex("\\s+"))
+            .map { clean(it) }
+            .filter { it.isNotEmpty() }
+
         val matches = mutableListOf<ToolsBoundingBox>()
 
         for (line in lines) {
-            val cleanLineText = clean(line.text)
-            val isMatch = cleanLineText.contains(cleanQuery) || cleanQuery.contains(cleanLineText) ||
-                    (cleanUser.length >= 4 && cleanLineText.contains(cleanUser))
+            val cleanLine = clean(line.text)
+            if (!cleanLine.contains(cleanQuery)) {
+                // Skip line if it doesn't contain the full query substring
+                continue
+            }
 
-            if (isMatch) {
-                if (line.words.isNotEmpty()) {
-                    val matchingWords = line.words.filter { word ->
-                        val cw = clean(word.text)
-                        cw.contains(cleanQuery) || cleanQuery.contains(cw) ||
-                                (cleanUser.length >= 4 && cw.contains(cleanUser))
+            val words = line.words
+            if (words.isEmpty()) {
+                matches.add(line.bbox)
+                continue
+            }
+
+            // Strategy 1: Contiguous Token Sequence Match (Word by Word)
+            if (queryTokens.isNotEmpty()) {
+                val qSize = queryTokens.size
+                var matchedSpan: List<OcrWordData>? = null
+
+                for (i in 0..(words.size - qSize)) {
+                    var allMatch = true
+                    for (j in 0 until qSize) {
+                        val wordClean = clean(words[i + j].text)
+                        val qWordClean = queryTokens[j]
+                        if (!wordClean.contains(qWordClean) && !qWordClean.contains(wordClean)) {
+                            allMatch = false
+                            break
+                        }
                     }
-
-                    if (matchingWords.isNotEmpty()) {
-                        val minX = matchingWords.minOf { it.bbox.x0 }
-                        val minY = matchingWords.minOf { it.bbox.y0 }
-                        val maxX = matchingWords.maxOf { it.bbox.x0 + it.bbox.width }
-                        val maxY = matchingWords.maxOf { it.bbox.y0 + it.bbox.height }
-                        matches.add(ToolsBoundingBox(minX, minY, maxX - minX, maxY - minY))
-                        continue
+                    if (allMatch) {
+                        matchedSpan = words.subList(i, i + qSize)
+                        break
                     }
                 }
+
+                if (matchedSpan != null && matchedSpan.isNotEmpty()) {
+                    val minX = matchedSpan.minOf { it.bbox.x0 }
+                    val minY = matchedSpan.minOf { it.bbox.y0 }
+                    val maxX = matchedSpan.maxOf { it.bbox.x0 + it.bbox.width }
+                    val maxY = matchedSpan.maxOf { it.bbox.y0 + it.bbox.height }
+                    matches.add(ToolsBoundingBox(minX, minY, maxX - minX, maxY - minY))
+                    continue
+                }
+            }
+
+            // Strategy 2: Substring Token Span Accumulator (for domains, symbols, and hyphenated text)
+            val accumulated = StringBuilder()
+            val wordIndices = mutableListOf<Int>()
+            var foundSpan = false
+
+            for ((wIdx, word) in words.withIndex()) {
+                val cWord = clean(word.text)
+                if (cWord.isEmpty()) continue
+
+                accumulated.append(cWord)
+                wordIndices.add(wIdx)
+
+                val accStr = accumulated.toString()
+                if (accStr.contains(cleanQuery)) {
+                    while (wordIndices.size > 1) {
+                        val firstIdx = wordIndices.first()
+                        val withoutFirst = accStr.substring(clean(words[firstIdx].text).length)
+                        if (withoutFirst.contains(cleanQuery)) {
+                            wordIndices.removeAt(0)
+                        } else {
+                            break
+                        }
+                    }
+
+                    val span = wordIndices.map { words[it] }
+                    val minX = span.minOf { it.bbox.x0 }
+                    val minY = span.minOf { it.bbox.y0 }
+                    val maxX = span.maxOf { it.bbox.x0 + it.bbox.width }
+                    val maxY = span.maxOf { it.bbox.y0 + it.bbox.height }
+                    matches.add(ToolsBoundingBox(minX, minY, maxX - minX, maxY - minY))
+                    foundSpan = true
+                    break
+                }
+            }
+
+            if (!foundSpan) {
                 matches.add(line.bbox)
             }
         }
+
         return matches
     }
 }
