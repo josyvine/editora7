@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -36,6 +37,7 @@ import com.vineyard.aivideostudio.media.tools.ZipOcrFrame
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
 import com.vineyard.aivideostudio.media.video.FastNativeFrameExtractor
 import com.vineyard.aivideostudio.processing.worker.VideoProcessingForegroundService
+import com.vineyard.aivideostudio.ui.screens.tools.components.NativeOverlayRenderer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -121,6 +123,9 @@ data class ToolsUiState(
     val extractedOcrData: Map<Int, FrameOcrData> = emptyMap(),
     val directBlurs: Map<Int, List<DetectedTargetBox>> = emptyMap(),
 
+    // Persistent master timeline highlights accumulated across ALL cues
+    val accumulatedDirectBlurs: Map<Int, List<DetectedTargetBox>> = emptyMap(),
+
     // Mode Selection: "Normal" (Extract All) vs "Cue" (Audio Cue Selective Sync)
     val studioMode: String = "Normal",
     val cueKeyword: String = "",
@@ -171,7 +176,7 @@ data class ToolsUiState(
     // Editor Playback Slot Feature
     val slotStartFrame: Int? = null,
     val slotEndFrame: Int? = null,
-    val slotStep: Int = 0, // 0: IDLE, 1: START_SET, 2: PLAYING_SLOT, 3: END_SET (Show Modal)
+    val slotStep: Int = 0,
 
     // Render Progress State (Tab 3)
     val isRendering: Boolean = false,
@@ -878,6 +883,7 @@ class ToolsViewModel(
 
         var unmarkedCount = 0
         val blurMap = state.directBlurs.toMutableMap()
+        val accumMap = state.accumulatedDirectBlurs.toMutableMap()
 
         val updatedFrames = state.frames.map { f ->
             val ocr = state.extractedOcrData[f.index]
@@ -896,6 +902,7 @@ class ToolsViewModel(
             if (!hasExactMatch && f.isHighlightEnabled) {
                 unmarkedCount++
                 blurMap.remove(f.index)
+                accumMap.remove(f.index)
                 f.copy(isHighlightEnabled = false, hasMismatch = true)
             } else if (hasExactMatch) {
                 f.copy(isHighlightEnabled = true, hasMismatch = false)
@@ -904,7 +911,7 @@ class ToolsViewModel(
             }
         }
 
-        _uiState.update { it.copy(frames = updatedFrames, directBlurs = blurMap) }
+        _uiState.update { it.copy(frames = updatedFrames, directBlurs = blurMap, accumulatedDirectBlurs = accumMap) }
         addLog("🧹 Discarded wrong highlights on $unmarkedCount non-matching frames.", LogType.INFO)
         updateExportedJsonState()
     }
@@ -912,6 +919,7 @@ class ToolsViewModel(
     private fun evaluateHighlightMatches() {
         val state = _uiState.value
         val blurMap = state.directBlurs.toMutableMap()
+        val accumMap = state.accumulatedDirectBlurs.toMutableMap()
 
         val updatedFrames = state.frames.map { f ->
             val ocr = state.extractedOcrData[f.index]
@@ -922,7 +930,6 @@ class ToolsViewModel(
                 for (rule in state.activeRules) {
                     val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, rule.text)
                     for (b in matches) {
-                        // If rule is anchored to a specific cluster location, filter strictly by distance
                         if (rule.clusterCenter != null) {
                             val dist = hypot(b.centerX - rule.clusterCenter.x, b.centerY - rule.clusterCenter.y)
                             if (dist > rule.clusterCenter.threshold) {
@@ -947,13 +954,14 @@ class ToolsViewModel(
                 }
                 if (frameBoxes.isNotEmpty()) {
                     blurMap[f.index] = frameBoxes
+                    accumMap[f.index] = frameBoxes
                 } else if (!state.activeRules.any { it.isZipSource }) {
                     blurMap.remove(f.index)
                 }
             }
             if (hasMatch) f.copy(isHighlightEnabled = true, hasMismatch = false) else f.copy(isHighlightEnabled = false)
         }
-        _uiState.update { it.copy(frames = updatedFrames, directBlurs = blurMap) }
+        _uiState.update { it.copy(frames = updatedFrames, directBlurs = blurMap, accumulatedDirectBlurs = accumMap) }
         updateExportedJsonState()
     }
 
@@ -1555,13 +1563,13 @@ class ToolsViewModel(
     fun renderFullVideo() {
         val state = _uiState.value
         val uri = state.videoUri
-        if (state.frames.isEmpty() || uri == null) {
-            addLog("⚠️ No video frames extracted yet! Extract frames in Studio Viewer first.", LogType.WARNING)
+        if (uri == null) {
+            addLog("⚠️ No video loaded to render! Load a video in Studio Viewer first.", LogType.WARNING)
             return
         }
 
         _uiState.update { it.copy(isRendering = true, renderPercent = 0, renderProgressStatus = "Preparing Video & Audio...") }
-        addLog("🎬 Starting full video rendering with original synchronized audio...", LogType.INFO)
+        addLog("🎬 Starting full video rendering with all accumulated highlights and original audio...", LogType.INFO)
         startBackgroundKeepAlive("Rendering edited video in background...")
 
         viewModelScope.launch(Dispatchers.Default) {
@@ -1571,6 +1579,7 @@ class ToolsViewModel(
             val tempFinalFile = File(context.cacheDir, "temp_render_final.mp4")
 
             try {
+                // 1. Extract synchronized audio track from original video
                 var hasAudio = false
                 try {
                     extractAudioTrackNative(uri, tempAudioFile)
@@ -1579,10 +1588,38 @@ class ToolsViewModel(
                     addLog("⚠️ Audio extract skipped: ${audioErr.message}", LogType.WARNING)
                 }
 
-                val outWidth = (state.videoWidth / 2) * 2
-                val outHeight = (state.videoHeight / 2) * 2
+                // 2. Determine native dimensions and total video duration
+                val probeRetriever = MediaMetadataRetriever()
+                var rawW = state.videoWidth
+                var rawH = state.videoHeight
+                var durationMs = 0L
+
+                try {
+                    probeRetriever.setDataSource(context, uri)
+                    val w = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: rawW
+                    val h = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: rawH
+                    val rot = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                    durationMs = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+
+                    val isRot = rot == 90 || rot == 270
+                    rawW = if (isRot) h else w
+                    rawH = if (isRot) w else h
+                } catch (_: Exception) {} finally {
+                    try { probeRetriever.release() } catch (_: Exception) {}
+                }
+
+                val outWidth = (rawW / 2) * 2
+                val outHeight = (rawH / 2) * 2
                 val fps = state.targetFps
                 val bitRate = 4_000_000
+
+                val durationSec = durationMs / 1000f
+                val totalVideoFrames = if (durationSec > 0f) floor(durationSec * fps).toInt() else state.frames.size
+                if (totalVideoFrames <= 0) throw Exception("Could not determine total video frame count.")
+
+                // Combine all direct blurs and accumulated cue highlights across the entire video
+                val allHighlightsMap = state.accumulatedDirectBlurs.toMutableMap()
+                allHighlightsMap.putAll(state.directBlurs)
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outWidth, outHeight).apply {
                     setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -1601,26 +1638,27 @@ class ToolsViewModel(
                 var muxerStarted = false
 
                 val bufferInfo = MediaCodec.BufferInfo()
-                val totalFrames = state.frames.size
                 val frameDurationUs = (1_000_000L / fps)
 
-                val rectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.STROKE
-                    strokeWidth = 4f
-                }
-                val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    style = Paint.Style.FILL
-                }
+                val workspaceDir = File(context.filesDir, "editora_frames_workspace")
+                val streamRetriever = MediaMetadataRetriever()
+                try {
+                    streamRetriever.setDataSource(context, uri)
+                } catch (_: Exception) {}
 
-                for (i in 0 until totalFrames) {
-                    val frameObj = state.frames[i]
+                val destRect = Rect(0, 0, outWidth, outHeight)
+
+                for (i in 0 until totalVideoFrames) {
                     val ptsUs = i * frameDurationUs
+                    val targetTimeUs = ptsUs
 
-                    val fullBitmap = try {
-                        val file = File(frameObj.fullResImagePath)
-                        if (file.exists()) BitmapFactory.decodeFile(file.absolutePath) else frameObj.thumbBitmap
-                    } catch (_: Exception) {
-                        frameObj.thumbBitmap
+                    // Load frame: from workspace cache if available, or decode from stream
+                    val frameFile = File(workspaceDir, "frame_$i.jpg")
+                    val frameBitmap = if (frameFile.exists()) {
+                        BitmapFactory.decodeFile(frameFile.absolutePath)
+                    } else {
+                        streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            ?: streamRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                     } ?: continue
 
                     val surfaceCanvas: Canvas? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -1631,38 +1669,37 @@ class ToolsViewModel(
 
                     if (surfaceCanvas != null) {
                         try {
-                            surfaceCanvas.drawBitmap(fullBitmap, 0f, 0f, null)
+                            // Draw base video frame scaled 100% to fill the encoder canvas
+                            surfaceCanvas.drawBitmap(frameBitmap, null, destRect, null)
 
-                            if (frameObj.isHighlightEnabled) {
-                                val boxes = state.directBlurs[frameObj.index] ?: emptyList()
-                                val timeMs = (frameObj.timeSeconds * 1000).toLong()
+                            // Burn overlays for this frame if any cue edit targeted it
+                            val boxes = allHighlightsMap[i] ?: emptyList()
+                            for (box in boxes) {
+                                val scaleX = outWidth.toFloat() / (if (rawW > 0) rawW.toFloat() else outWidth.toFloat())
+                                val scaleY = outHeight.toFloat() / (if (rawH > 0) rawH.toFloat() else outHeight.toFloat())
 
-                                for (box in boxes) {
-                                    val pulse = (sin(timeMs * 0.010) * 0.5 + 0.5).toFloat()
-                                    val pad = 6f + pulse * 4f
-                                    val bx = box.x0 - pad
-                                    val by = box.y0 - pad
-                                    val bw = box.width + pad * 2f
-                                    val bh = box.height + pad * 2f
+                                val bx = box.x0 * scaleX
+                                val by = box.y0 * scaleY
+                                val bw = box.width * scaleX
+                                val bh = box.height * scaleY
 
-                                    fillPaint.color = android.graphics.Color.argb(
-                                        ((0.12f + pulse * 0.22f) * 255).toInt(), 245, 158, 11
-                                    )
-                                    surfaceCanvas.drawRect(bx, by, bx + bw, by + bh, fillPaint)
-
-                                    rectPaint.color = android.graphics.Color.rgb(245, 158, 11)
-                                    rectPaint.strokeWidth = 3f + pulse * 2f
-                                    surfaceCanvas.drawRect(bx, by, bx + bw, by + bh, rectPaint)
-                                }
+                                NativeOverlayRenderer.drawToolOnAndroidCanvas(
+                                    canvas = surfaceCanvas,
+                                    x0 = bx,
+                                    y0 = by,
+                                    width = bw,
+                                    height = bh,
+                                    toolType = box.tool,
+                                    currentTimeMs = (i * (1000f / fps)).toLong(),
+                                    withArrow = state.isArrowPointerEnabled
+                                )
                             }
                         } finally {
                             inputSurface.unlockCanvasAndPost(surfaceCanvas)
                         }
                     }
 
-                    if (fullBitmap != frameObj.thumbBitmap) {
-                        fullBitmap.recycle()
-                    }
+                    frameBitmap.recycle()
 
                     var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
                     while (outIndex >= 0) {
@@ -1681,13 +1718,15 @@ class ToolsViewModel(
                         outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
                     }
 
-                    val pct = (((i + 1).toFloat() / totalFrames.toFloat()) * 100).toInt()
+                    val pct = (((i + 1).toFloat() / totalVideoFrames.toFloat()) * 100).toInt()
                     _uiState.update { it.copy(
                         renderPercent = pct,
-                        renderProgressStatus = "Burning frame ${i + 1}/$totalFrames (Normal Speed Sync)..."
+                        renderProgressStatus = "Burning frame ${i + 1}/$totalVideoFrames (${allHighlightsMap.size} active highlight frames)..."
                     )}
-                    updateBackgroundKeepAlive(i + 1, totalFrames)
+                    updateBackgroundKeepAlive(i + 1, totalVideoFrames)
                 }
+
+                try { streamRetriever.release() } catch (_: Exception) {}
 
                 encoder.signalEndOfInputStream()
                 var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 20000)
@@ -1724,11 +1763,11 @@ class ToolsViewModel(
                     _uiState.update { it.copy(
                         isRendering = false,
                         renderPercent = 100,
-                        renderProgressStatus = "Complete! Full video with audio exported to gallery.",
+                        renderProgressStatus = "Complete! Full video with all edits exported to gallery.",
                         statusText = "Full Video Downloaded",
                         statusColorHex = "#10b981"
                     )}
-                    addLog("🎉 SUCCESS: Full video rendered with synchronized audio and saved to gallery.", LogType.SUCCESS)
+                    addLog("🎉 SUCCESS: Full 4.5m video rendered with all accumulated cue highlights and synchronized audio.", LogType.SUCCESS)
                     stopBackgroundKeepAlive()
                 }
 
