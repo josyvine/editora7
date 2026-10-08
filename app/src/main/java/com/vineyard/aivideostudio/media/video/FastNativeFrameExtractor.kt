@@ -47,7 +47,7 @@ data class WorkerInitInfo(
 
 /**
  * High-performance, multi-threaded native frame extraction engine.
- * Employs 10 isolated kernel file descriptors for true non-blocking parallel hardware decoding.
+ * Employs isolated kernel file descriptors for true non-blocking parallel hardware decoding.
  */
 class FastNativeFrameExtractor(private val context: Context) {
 
@@ -158,7 +158,6 @@ class FastNativeFrameExtractor(private val context: Context) {
                 var workerDoneCount = 0
 
                 try {
-                    // Each worker opens its OWN independent ParcelFileDescriptor and file offset
                     workerPfd = try {
                         context.contentResolver.openFileDescriptor(videoUri, "r")
                     } catch (_: Exception) {
@@ -171,7 +170,6 @@ class FastNativeFrameExtractor(private val context: Context) {
                         workerRetriever.setDataSource(context, videoUri)
                     }
 
-                    // 100 frames per batch (1,000 frames total across 10 streams)
                     val batchSize = 100
                     var currentBatchStart = workerInfo.startFrame
                     val workerEndBound = workerInfo.endFrame + 1
@@ -186,7 +184,6 @@ class FastNativeFrameExtractor(private val context: Context) {
                             val targetTimeUs = i * intervalUs
                             val timeSec = targetTimeUs / 1_000_000f
 
-                            // Hardware-accelerated frame decode
                             val frameBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && targetDecodeWidth > 0 && targetDecodeHeight > 0) {
                                 workerRetriever.getScaledFrameAtTime(
                                     targetTimeUs,
@@ -203,13 +200,11 @@ class FastNativeFrameExtractor(private val context: Context) {
                                 workerRetriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                             } ?: continue
 
-                            // 1. Filmstrip lightweight thumbnail (120px)
                             val thumbWidth = 120
                             val aspect = frameBitmap.height.toFloat() / frameBitmap.width.toFloat()
                             val thumbHeight = (thumbWidth * aspect).roundToInt().coerceAtLeast(1)
                             val thumbBitmap = Bitmap.createScaledBitmap(frameBitmap, thumbWidth, thumbHeight, false)
 
-                            // 2. High-speed 64KB buffered stream write
                             val frameFile = File(workspaceDir, "frame_$i.jpg")
                             try {
                                 BufferedOutputStream(FileOutputStream(frameFile), 65536).use { outStream ->
@@ -236,7 +231,6 @@ class FastNativeFrameExtractor(private val context: Context) {
                             framesProcessedInBatch++
                         }
 
-                        // Emit progress strictly per 100-frame batch completed
                         if (framesProcessedInBatch > 0) {
                             workerDoneCount += framesProcessedInBatch
                             val completed = completedCounter.addAndGet(framesProcessedInBatch)
@@ -268,6 +262,156 @@ class FastNativeFrameExtractor(private val context: Context) {
         }
 
         return@withContext sortedFrames
+    }
+
+    /**
+     * Selective Frame Range Extraction for Audio Cue Sync Mode.
+     * Extracts ONLY the frames between [startFrame] and [endFrame] directly in ~1 second.
+     */
+    suspend fun extractFrameRange(
+        videoUri: Uri,
+        startFrame: Int,
+        endFrame: Int,
+        targetFps: Int,
+        onProgress: (current: Int, total: Int) -> Unit
+    ): List<ExtractedFrame> = withContext(Dispatchers.IO) {
+        val workspaceDir = File(context.filesDir, "editora_frames_workspace")
+        if (!workspaceDir.exists()) {
+            workspaceDir.mkdirs()
+        }
+
+        val probeRetriever = MediaMetadataRetriever()
+        var probePfd: ParcelFileDescriptor? = null
+        val targetDecodeWidth: Int
+        val targetDecodeHeight: Int
+
+        try {
+            probePfd = try {
+                context.contentResolver.openFileDescriptor(videoUri, "r")
+            } catch (_: Exception) {
+                null
+            }
+
+            if (probePfd != null) {
+                probeRetriever.setDataSource(probePfd.fileDescriptor)
+            } else {
+                probeRetriever.setDataSource(context, videoUri)
+            }
+
+            val rawWidth = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            val rawHeight = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            val rotation = probeRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+
+            val isRotated = rotation == 90 || rotation == 270
+            val origWidth = if (isRotated) rawHeight else rawWidth
+            val origHeight = if (isRotated) rawWidth else rawHeight
+
+            val maxAllowedDimension = 1280
+            var decW = rawWidth
+            var decH = rawHeight
+
+            if (origWidth > 0 && origHeight > 0) {
+                if (origWidth >= origHeight && origWidth > maxAllowedDimension) {
+                    val scale = maxAllowedDimension.toFloat() / origWidth
+                    decW = if (isRotated) (rawWidth * scale).roundToInt() else maxAllowedDimension
+                    decH = if (isRotated) maxAllowedDimension else (rawHeight * scale).roundToInt()
+                } else if (origHeight > origWidth && origHeight > maxAllowedDimension) {
+                    val scale = maxAllowedDimension.toFloat() / origHeight
+                    decW = if (isRotated) maxAllowedDimension else (rawWidth * scale).roundToInt()
+                    decH = if (isRotated) (rawHeight * scale).roundToInt() else maxAllowedDimension
+                }
+            }
+            targetDecodeWidth = decW
+            targetDecodeHeight = decH
+        } finally {
+            try { probeRetriever.release() } catch (_: Exception) {}
+            try { probePfd?.close() } catch (_: Exception) {}
+        }
+
+        val intervalUs = (1_000_000L / targetFps)
+        val totalToExtract = (endFrame - startFrame + 1).coerceAtLeast(0)
+        if (totalToExtract <= 0) return@withContext emptyList()
+
+        val retriever = MediaMetadataRetriever()
+        var workerPfd: ParcelFileDescriptor? = null
+        val resultFrames = mutableListOf<ExtractedFrame>()
+
+        try {
+            workerPfd = try {
+                context.contentResolver.openFileDescriptor(videoUri, "r")
+            } catch (_: Exception) {
+                null
+            }
+
+            if (workerPfd != null) {
+                retriever.setDataSource(workerPfd.fileDescriptor)
+            } else {
+                retriever.setDataSource(context, videoUri)
+            }
+
+            var doneCount = 0
+            for (i in startFrame..endFrame) {
+                if (!isActive) break
+
+                val targetTimeUs = i * intervalUs
+                val timeSec = targetTimeUs / 1_000_000f
+
+                val frameBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 && targetDecodeWidth > 0 && targetDecodeHeight > 0) {
+                    retriever.getScaledFrameAtTime(
+                        targetTimeUs,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                        targetDecodeWidth,
+                        targetDecodeHeight
+                    ) ?: retriever.getScaledFrameAtTime(
+                        targetTimeUs,
+                        MediaMetadataRetriever.OPTION_CLOSEST,
+                        targetDecodeWidth,
+                        targetDecodeHeight
+                    ) ?: retriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                } else {
+                    retriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                } ?: continue
+
+                val thumbWidth = 120
+                val aspect = frameBitmap.height.toFloat() / frameBitmap.width.toFloat()
+                val thumbHeight = (thumbWidth * aspect).roundToInt().coerceAtLeast(1)
+                val thumbBitmap = Bitmap.createScaledBitmap(frameBitmap, thumbWidth, thumbHeight, false)
+
+                val frameFile = File(workspaceDir, "frame_$i.jpg")
+                try {
+                    BufferedOutputStream(FileOutputStream(frameFile), 65536).use { outStream ->
+                        frameBitmap.compress(Bitmap.CompressFormat.JPEG, 75, outStream)
+                    }
+                } catch (writeErr: Exception) {
+                    writeErr.printStackTrace()
+                }
+
+                frameBitmap.recycle()
+
+                val timeFormatted = String.format(Locale.US, "%.2f", timeSec)
+                resultFrames.add(
+                    ExtractedFrame(
+                        index = i,
+                        timeSeconds = timeSec,
+                        timeFormatted = timeFormatted,
+                        fullResImagePath = frameFile.absolutePath,
+                        thumbBitmap = thumbBitmap
+                    )
+                )
+
+                doneCount++
+                withContext(Dispatchers.Main) {
+                    onProgress(doneCount, totalToExtract)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+            try { workerPfd?.close() } catch (_: Exception) {}
+        }
+
+        return@withContext resultFrames
     }
 
     /**
