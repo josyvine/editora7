@@ -118,6 +118,10 @@ data class ToolsUiState(
     val frames: List<ExtractedFrame> = emptyList(),
     val extractedOcrData: Map<Int, FrameOcrData> = emptyMap(),
     val directBlurs: Map<Int, List<DetectedTargetBox>> = emptyMap(),
+
+    // Mode Selection: "Normal" (Extract All) vs "Cue" (Audio Cue Selective Sync)
+    val studioMode: String = "Normal",
+    val cueKeyword: String = "",
     
     // Status Badge & Progress
     val statusText: String = "Ready",
@@ -193,6 +197,15 @@ class ToolsViewModel(
         val savedKey = geminiPreferences.getApiKey()
         _uiState.update { it.copy(geminiApiKey = savedKey) }
         addLog("🤖 Gemini Native Audio Engine Ready. Awaiting user action.", LogType.INFO)
+    }
+
+    fun setStudioMode(mode: String) {
+        _uiState.update { it.copy(studioMode = mode) }
+        addLog("Switched mode to: $mode", LogType.INFO)
+    }
+
+    fun setCueKeyword(keyword: String) {
+        _uiState.update { it.copy(cueKeyword = keyword) }
     }
 
     // =========================================================
@@ -287,10 +300,11 @@ class ToolsViewModel(
                 videoWidth = vWidth,
                 videoHeight = vHeight,
                 geminiApiKey = it.geminiApiKey,
+                studioMode = it.studioMode,
                 activeLogEntries = it.activeLogEntries
             ) 
         }
-        addLog("📹 Video loaded into Native Studio workspace ($vWidth x $vHeight).", LogType.INFO)
+        addLog("📹 Video loaded into Native Studio workspace ($vWidth x $vHeight). Ready for playback.", LogType.INFO)
     }
 
     private fun initMediaPlayer(uri: Uri) {
@@ -412,6 +426,90 @@ class ToolsViewModel(
         }
     }
 
+    /**
+     * Extracts ONLY the selective frame range for the chosen Audio Cue and Keyword sub-timing.
+     */
+    fun extractCueFrames() {
+        val state = _uiState.value
+        val uri = state.videoUri ?: return
+        val selectedId = state.selectedAudioCueId
+        val cue = state.detectedAudioCues.find { it.id.toString() == selectedId } 
+            ?: state.detectedAudioCues.firstOrNull()
+
+        if (cue == null) {
+            addLog("⚠️ Please select a transcription cue from the dropdown first.", LogType.WARNING)
+            return
+        }
+
+        val fps = state.targetFps
+        val keyword = state.cueKeyword.trim()
+        val fullText = cue.snippet
+
+        var startF = cue.startFrame
+        var endF = cue.endFrame
+
+        // Sub-timing precision calculation when keyword box has text
+        if (keyword.isNotEmpty() && fullText.contains(keyword, ignoreCase = true)) {
+            val startCharIdx = fullText.indexOf(keyword, ignoreCase = true)
+            val endCharIdx = startCharIdx + keyword.length
+            val totalChars = fullText.length.coerceAtLeast(1)
+
+            val cueDuration = (cue.endFrame - cue.startFrame).toFloat() / fps
+            val cueStartSec = cue.startFrame.toFloat() / fps
+
+            val subStartSec = (cueStartSec + (startCharIdx.toFloat() / totalChars) * cueDuration - 0.3f).coerceAtLeast(0f)
+            val subEndSec = (cueStartSec + (endCharIdx.toFloat() / totalChars) * cueDuration + 0.3f)
+
+            startF = floor(subStartSec * fps).toInt().coerceAtLeast(0)
+            endF = ceil(subEndSec * fps).toInt().coerceAtLeast(startF + 1)
+            addLog("🎯 Keyword '$keyword' narrowed dialogue window to Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
+        } else {
+            addLog("🎯 Using full dialogue cue window: Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
+        }
+
+        _uiState.update { it.copy(
+            isProcessing = true,
+            statusText = "Extracting Cue...",
+            statusColorHex = "#eab308"
+        )}
+
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val extractedList = frameExtractor.extractFrameRange(
+                    videoUri = uri,
+                    startFrame = startF,
+                    endFrame = endF,
+                    targetFps = fps,
+                    onProgress = { current, total ->
+                        val pct = if (total > 0) ((current.toFloat() / total.toFloat()) * 100).toInt() else 0
+                        _uiState.update { it.copy(
+                            statusText = "Extracting $current/$total",
+                            progressPercent = pct
+                        )}
+                    }
+                )
+
+                withContext(Dispatchers.Main) {
+                    _uiState.update { it.copy(
+                        frames = extractedList,
+                        currentFrameIndex = 0,
+                        isProcessing = false,
+                        statusText = "${extractedList.size} Cue Frames Ready",
+                        statusColorHex = "#10b981",
+                        progressPercent = 0
+                    )}
+                    addLog("✅ Extracted ${extractedList.size} selective cue frames in ~1 second.", LogType.SUCCESS)
+                    seekToFrame(0)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    addLog("❌ Cue Extraction Error: ${e.message}", LogType.ERROR)
+                    _uiState.update { it.copy(isProcessing = false, statusText = "Cue Failed", statusColorHex = "#ef4444") }
+                }
+            }
+        }
+    }
+
     // =========================================================
     // VIDEO TRANSPORT, STEPPING, AUDIO & SLOT CYCLE
     // =========================================================
@@ -421,7 +519,7 @@ class ToolsViewModel(
 
     private fun startPlayback() {
         val state = _uiState.value
-        if (state.frames.isEmpty()) return
+        if (mediaPlayer == null && state.frames.isEmpty()) return
 
         _uiState.update { it.copy(isPlaying = true) }
         if (state.slotStep == 1) {
@@ -429,7 +527,11 @@ class ToolsViewModel(
         }
 
         try {
-            val seekMs = (state.currentFrameIndex * (1000f / state.targetFps)).toLong()
+            val seekMs = if (state.frames.isNotEmpty()) {
+                (state.currentFrameIndex * (1000f / state.targetFps)).toLong()
+            } else {
+                mediaPlayer?.currentPosition?.toLong() ?: 0L
+            }
             mediaPlayer?.seekTo(seekMs.toInt())
             val vol = if (state.isAudioMuted) 0f else 1f
             mediaPlayer?.setVolume(vol, vol)
@@ -442,16 +544,28 @@ class ToolsViewModel(
             val frameIntervalMs = (1000L / fps).coerceAtLeast(10L)
             
             var currentIndex = _uiState.value.currentFrameIndex
-            while (currentIndex < _uiState.value.frames.size - 1) {
-                val startTime = System.currentTimeMillis()
-                currentIndex++
-                _uiState.update { it.copy(currentFrameIndex = currentIndex) }
-                
-                val elapsed = System.currentTimeMillis() - startTime
-                val sleepTime = (frameIntervalMs - elapsed).coerceAtLeast(5L)
-                delay(sleepTime)
+            val maxFrames = _uiState.value.frames.size
+
+            while (_uiState.value.isPlaying) {
+                if (maxFrames > 0 && currentIndex < maxFrames - 1) {
+                    val startTime = System.currentTimeMillis()
+                    currentIndex++
+                    _uiState.update { it.copy(currentFrameIndex = currentIndex) }
+                    
+                    val elapsed = System.currentTimeMillis() - startTime
+                    val sleepTime = (frameIntervalMs - elapsed).coerceAtLeast(5L)
+                    delay(sleepTime)
+                } else if (maxFrames == 0) {
+                    delay(100L)
+                    if (mediaPlayer?.isPlaying == false) {
+                        pausePlayback()
+                        break
+                    }
+                } else {
+                    pausePlayback()
+                    break
+                }
             }
-            pausePlayback()
         }
     }
 
@@ -1342,7 +1456,6 @@ class ToolsViewModel(
             val tempFinalFile = File(context.cacheDir, "temp_render_final.mp4")
 
             try {
-                // Step 1: Extract audio track from original video
                 var hasAudio = false
                 try {
                     extractAudioTrackNative(uri, tempAudioFile)
@@ -1351,11 +1464,10 @@ class ToolsViewModel(
                     addLog("⚠️ Audio extract skipped: ${audioErr.message}", LogType.WARNING)
                 }
 
-                // Step 2: Encode video frames with burned overlays using native MediaCodec
                 val outWidth = (state.videoWidth / 2) * 2
                 val outHeight = (state.videoHeight / 2) * 2
                 val fps = state.targetFps
-                val bitRate = 4_000_000 // 4 Mbps high quality
+                val bitRate = 4_000_000
 
                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outWidth, outHeight).apply {
                     setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
