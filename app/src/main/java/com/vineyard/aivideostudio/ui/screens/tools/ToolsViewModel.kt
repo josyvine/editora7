@@ -428,8 +428,9 @@ class ToolsViewModel(
     }
 
     /**
-     * Extracts the complete audio cue window with lead/trail padding,
-     * guaranteeing that the entire visual action is preserved without cutting off the beginning.
+     * Extracts ONLY the selective frame range for the chosen Audio Cue.
+     * When a keyword is provided, narrows start and end frames proportionally;
+     * when empty, extracts the full dialogue window with safe buffers.
      */
     fun extractCueFrames() {
         val state = _uiState.value
@@ -444,15 +445,33 @@ class ToolsViewModel(
         }
 
         val fps = state.targetFps
-        
-        // Universal Rule: Always preserve the full cue start and end with 0.3s padding
-        // so visual clicks and cursor motions are never cut off.
-        val bufferFrames = maxOf(3, (0.3f * fps).toInt())
-        val startF = maxOf(0, cue.startFrame - bufferFrames)
-        val endF = cue.endFrame + bufferFrames
-        val totalCueFrames = endF - startF + 1
+        val keyword = state.cueKeyword.trim()
+        val fullText = cue.snippet
 
-        addLog("🎯 Extracting full cue window: Fr $startF - $endF (~$totalCueFrames frames).", LogType.INFO)
+        val startF: Int
+        val endF: Int
+
+        // Universal sub-timing calculation: When keyword is typed, narrow the frame range
+        if (keyword.isNotEmpty() && fullText.contains(keyword, ignoreCase = true)) {
+            val startCharIdx = fullText.indexOf(keyword, ignoreCase = true)
+            val endCharIdx = startCharIdx + keyword.length
+            val totalChars = fullText.length.coerceAtLeast(1)
+
+            val cueDuration = (cue.endFrame - cue.startFrame).toFloat() / fps
+            val cueStartSec = cue.startFrame.toFloat() / fps
+
+            val subStartSec = maxOf(0f, cueStartSec + (startCharIdx.toFloat() / totalChars) * cueDuration - 0.25f)
+            val subEndSec = cueStartSec + (endCharIdx.toFloat() / totalChars) * cueDuration + 0.35f
+
+            startF = floor(subStartSec * fps).toInt().coerceAtLeast(0)
+            endF = ceil(subEndSec * fps).toInt().coerceAtLeast(startF + 1)
+            addLog("🎯 Keyword '$keyword' narrowed dialogue window to Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
+        } else {
+            val bufferFrames = maxOf(2, (0.25f * fps).toInt())
+            startF = maxOf(0, cue.startFrame - bufferFrames)
+            endF = cue.endFrame + bufferFrames
+            addLog("🎯 Extracting full dialogue window: Fr $startF - $endF (~${endF - startF + 1} frames).", LogType.INFO)
+        }
 
         _uiState.update { it.copy(
             isProcessing = true,
@@ -518,7 +537,7 @@ class ToolsViewModel(
         if (mediaPlayer == null && state.frames.isEmpty()) return
 
         _uiState.update { it.copy(isPlaying = true) }
-        if (state.slotStep == 1) {
+        if (state.studioMode != "Cue" && state.slotStep == 1) {
             _uiState.update { it.copy(slotStep = 2) }
         }
 
@@ -572,6 +591,12 @@ class ToolsViewModel(
         } catch (_: Exception) {}
 
         val state = _uiState.value
+        if (state.studioMode == "Cue") {
+            // In Cue mode, do not trigger the SlotCaptureDialog popup modal
+            _uiState.update { it.copy(isPlaying = false) }
+            return
+        }
+
         var newSlotStep = state.slotStep
         var newSlotStart = state.slotStartFrame
         var newSlotEnd = state.slotEndFrame
@@ -1874,3 +1899,4 @@ class ToolsViewModel(
         ocrEngine.close()
     }
 }
+
