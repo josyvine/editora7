@@ -87,7 +87,7 @@ object SpatialClusterer {
 
     /**
      * Groups detected keyword bounding boxes across all video frames into spatial clusters
-     * using Euclidean distance thresholds and classifies UI regions (Header, Footer, Sidebar, etc.).
+     * using Euclidean distance thresholds and classifies UI regions dynamically.
      */
     fun clusterBoxes(
         boxes: List<DetectedTargetBox>,
@@ -140,17 +140,17 @@ object SpatialClusterer {
             }
         }
 
-        // Region categorization and formatted naming
+        // Universal UI Region Classification based on screen geometry
         for ((index, cluster) in clusters.withIndex()) {
             val rx = cluster.centerX / effectiveWidth
             val ry = cluster.centerY / effectiveHeight
 
             val regionLabel = when {
-                ry <= 0.18f -> "Top Header Bar"
-                ry >= 0.82f -> "Bottom Bar / Footer"
-                rx <= 0.45f -> "Left Sidebar / Drawer"
-                rx >= 0.60f -> "Right Panel / Settings"
-                else -> "Main Content Body"
+                ry <= 0.15f -> "Top Header Area"
+                ry >= 0.85f -> "Bottom Footer Area"
+                rx <= 0.15f -> "Left Panel / Sidebar"
+                rx >= 0.85f -> "Right Panel / Edge"
+                else -> "Main Content Area"
             }
 
             cluster.shortLabel = regionLabel
@@ -253,7 +253,7 @@ object SpatialClusterer {
         for (line in lines) {
             val cleanLine = clean(line.text)
             if (!cleanLine.contains(cleanQuery)) {
-                // Skip line if it doesn't contain the full query substring
+                // Skip line if it doesn't contain the full query string
                 continue
             }
 
@@ -273,7 +273,7 @@ object SpatialClusterer {
                     for (j in 0 until qSize) {
                         val wordClean = clean(words[i + j].text)
                         val qWordClean = queryTokens[j]
-                        if (!wordClean.contains(qWordClean) && !qWordClean.contains(wordClean)) {
+                        if (wordClean != qWordClean && !wordClean.startsWith(qWordClean)) {
                             allMatch = false
                             break
                         }
