@@ -83,16 +83,20 @@ data class FrameOcrData(
 
 /**
  * High-speed native OCR engine using on-device Google ML Kit Vision.
- * Features perceptual frame deduplication and efficient memory recycling.
+ * Features automatic programmatic ROI masking and perceptual frame deduplication.
  */
 class NativeBatchOcrEngine {
 
     private val textRecognizer: TextRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
     /**
-     * Scans a single frame from its disk cache path and extracts lines and word bounding boxes.
+     * Scans a single frame with optional programmatic ROI masking.
+     * When [roiMask] is provided, isolates only the target coordinate window in memory.
      */
-    suspend fun scanFrame(frame: ExtractedFrame): FrameOcrData = withContext(Dispatchers.IO) {
+    suspend fun scanFrame(
+        frame: ExtractedFrame,
+        roiMask: ToolsBoundingBox? = null
+    ): FrameOcrData = withContext(Dispatchers.IO) {
         val file = File(frame.fullResImagePath)
         if (!file.exists()) {
             return@withContext FrameOcrData(frame.index, frame.timeSeconds, emptyList())
@@ -101,13 +105,33 @@ class NativeBatchOcrEngine {
         val decodeOptions = BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        val bitmap = BitmapFactory.decodeFile(file.absolutePath, decodeOptions)
+        val fullBitmap = BitmapFactory.decodeFile(file.absolutePath, decodeOptions)
             ?: return@withContext FrameOcrData(frame.index, frame.timeSeconds, emptyList())
 
+        var targetBitmap = fullBitmap
+        var offsetX = 0f
+        var offsetY = 0f
+
+        // Programmatic Blackout / ROI Crop Masking (Zero Drag)
+        if (roiMask != null && roiMask.width > 5f && roiMask.height > 5f) {
+            val rx = roiMask.x0.toInt().coerceIn(0, fullBitmap.width - 1)
+            val ry = roiMask.y0.toInt().coerceIn(0, fullBitmap.height - 1)
+            val rw = roiMask.width.toInt().coerceIn(1, fullBitmap.width - rx)
+            val rh = roiMask.height.toInt().coerceIn(1, fullBitmap.height - ry)
+
+            try {
+                targetBitmap = Bitmap.createBitmap(fullBitmap, rx, ry, rw, rh)
+                offsetX = rx.toFloat()
+                offsetY = ry.toFloat()
+            } catch (_: Exception) {
+                targetBitmap = fullBitmap
+            }
+        }
+
         return@withContext try {
-            val inputImage = InputImage.fromBitmap(bitmap, 0)
+            val inputImage = InputImage.fromBitmap(targetBitmap, 0)
             val visionText: Text = textRecognizer.process(inputImage).await()
-            val extractedLines = parseVisionText(visionText)
+            val extractedLines = parseVisionText(visionText, offsetX, offsetY)
 
             FrameOcrData(
                 frameIndex = frame.index,
@@ -120,28 +144,31 @@ class NativeBatchOcrEngine {
             e.printStackTrace()
             FrameOcrData(frame.index, frame.timeSeconds, emptyList())
         } finally {
-            bitmap.recycle() // Keep RAM footprint clean
+            if (targetBitmap != fullBitmap && !targetBitmap.isRecycled) {
+                targetBitmap.recycle()
+            }
+            if (!fullBitmap.isRecycled) {
+                fullBitmap.recycle()
+            }
         }
     }
 
     /**
-     * Scans multiple frames at high speed with perceptual deduplication and IDM-style parallel concurrency.
-     * Divides workload across concurrent worker streams and processes sub-batches of 10 frames simultaneously.
+     * Scans multiple frames in parallel with optional programmatic ROI masking.
      */
     suspend fun scanBatch(
         frames: List<ExtractedFrame>,
+        roiMask: ToolsBoundingBox? = null,
         parallelWorkers: Int = 5,
         onProgress: (current: Int, total: Int) -> Unit
     ): Map<Int, FrameOcrData> = withContext(Dispatchers.IO) {
         val totalCount = frames.size
         if (totalCount == 0) return@withContext emptyMap()
 
-        // Sort chronologically before splitting to preserve timeline sequence
         val sortedFrames = frames.sortedBy { it.index }
         val resultsMap = ConcurrentHashMap<Int, FrameOcrData>()
         val completedCounter = AtomicInteger(0)
 
-        // IDM partition into concurrent worker streams
         val workerCount = min(parallelWorkers.coerceAtLeast(1), 5)
         val chunkSize = ceil(totalCount.toFloat() / workerCount.toFloat()).toInt()
 
@@ -155,7 +182,6 @@ class NativeBatchOcrEngine {
                 var lastScannedFrame: ExtractedFrame? = null
                 var lastOcrData: FrameOcrData? = null
 
-                // Process in mini-batches of 10 frames
                 val batchSize = 10
                 var batchStart = startIdx
 
@@ -168,7 +194,7 @@ class NativeBatchOcrEngine {
                         val frame = sortedFrames[i]
 
                         // Check perceptual similarity within this continuous timeline segment
-                        if (lastScannedFrame != null && lastOcrData != null &&
+                        if (roiMask == null && lastScannedFrame != null && lastOcrData != null &&
                             areBitmapsSimilar(lastScannedFrame.thumbBitmap, frame.thumbBitmap)
                         ) {
                             val reusedData = FrameOcrData(
@@ -178,7 +204,7 @@ class NativeBatchOcrEngine {
                             )
                             resultsMap[frame.index] = reusedData
                         } else {
-                            val ocrData = scanFrame(frame)
+                            val ocrData = scanFrame(frame, roiMask)
                             resultsMap[frame.index] = ocrData
                             lastScannedFrame = frame
                             lastOcrData = ocrData
@@ -187,7 +213,6 @@ class NativeBatchOcrEngine {
                         batchDoneCount++
                     }
 
-                    // Dispatch progress strictly per 10-frame mini-batch completed
                     if (batchDoneCount > 0) {
                         val done = completedCounter.addAndGet(batchDoneCount)
                         withContext(Dispatchers.Main) {
@@ -211,7 +236,6 @@ class NativeBatchOcrEngine {
 
     /**
      * Fast sub-millisecond perceptual difference check using the in-memory thumbnails.
-     * Returns true if differences between [bmpA] and [bmpB] are within [thresholdPercent].
      */
     private fun areBitmapsSimilar(bmpA: Bitmap?, bmpB: Bitmap?, thresholdPercent: Float = 2.0f): Boolean {
         if (bmpA == null || bmpB == null) return false
@@ -220,7 +244,7 @@ class NativeBatchOcrEngine {
 
         val w = bmpA.width
         val h = bmpA.height
-        val step = 4 // Sample 1 in every 16 pixels for microsecond execution
+        val step = 4
         var diffCount = 0
         var sampledCount = 0
 
@@ -234,7 +258,7 @@ class NativeBatchOcrEngine {
                     val rDiff = abs((pixelA shr 16 and 0xFF) - (pixelB shr 16 and 0xFF))
                     val gDiff = abs((pixelA shr 8 and 0xFF) - (pixelB shr 8 and 0xFF))
                     val bDiff = abs((pixelA and 0xFF) - (pixelB and 0xFF))
-                    if (rDiff + gDiff + bDiff > 40) { // Color distance threshold (filters compression noise)
+                    if (rDiff + gDiff + bDiff > 40) {
                         diffCount++
                     }
                 }
@@ -247,9 +271,10 @@ class NativeBatchOcrEngine {
     }
 
     /**
-     * Converts ML Kit Vision Text structure into normalized [OcrLineData] and [OcrWordData].
+     * Converts ML Kit Vision Text structure into normalized [OcrLineData] and [OcrWordData],
+     * mapping cropped patch coordinates back to the full video surface via [offsetX] and [offsetY].
      */
-    private fun parseVisionText(visionText: Text): List<OcrLineData> {
+    private fun parseVisionText(visionText: Text, offsetX: Float = 0f, offsetY: Float = 0f): List<OcrLineData> {
         val linesList = mutableListOf<OcrLineData>()
 
         for (block in visionText.textBlocks) {
@@ -259,8 +284,8 @@ class NativeBatchOcrEngine {
 
                 val lineRect = line.boundingBox ?: Rect(0, 0, 0, 0)
                 val lineBoundingBox = ToolsBoundingBox(
-                    x0 = lineRect.left.toFloat(),
-                    y0 = lineRect.top.toFloat(),
+                    x0 = lineRect.left.toFloat() + offsetX,
+                    y0 = lineRect.top.toFloat() + offsetY,
                     width = lineRect.width().toFloat(),
                     height = lineRect.height().toFloat()
                 )
@@ -272,8 +297,8 @@ class NativeBatchOcrEngine {
 
                     val elementRect = element.boundingBox ?: Rect(0, 0, 0, 0)
                     val wordBoundingBox = ToolsBoundingBox(
-                        x0 = elementRect.left.toFloat(),
-                        y0 = elementRect.top.toFloat(),
+                        x0 = elementRect.left.toFloat() + offsetX,
+                        y0 = elementRect.top.toFloat() + offsetY,
                         width = elementRect.width().toFloat(),
                         height = elementRect.height().toFloat()
                     )
@@ -305,7 +330,6 @@ class NativeBatchOcrEngine {
     fun close() {
         try {
             textRecognizer.close()
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) {}
     }
 }
