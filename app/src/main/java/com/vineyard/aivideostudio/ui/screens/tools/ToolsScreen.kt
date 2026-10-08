@@ -59,6 +59,7 @@ import com.vineyard.aivideostudio.ui.screens.tools.components.ToolsOverlayPrevie
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.math.hypot
 
 // Custom Colors matching Video OCR Studio theme
 private val BgDark = Color(0xFF090D16)
@@ -86,20 +87,13 @@ val ALL_EDITORA_TOOLS = listOf(
     "vertical_column" to "Vertical Pillar / Sidebar Frame"
 )
 
-val ALL_CATEGORIES = listOf(
-    "global_anywhere" to "Category: Global (Anywhere)",
-    "sidebar_menu" to "Category: Sidebar Menu",
-    "top_header" to "Category: Top Header Bar",
-    "settings_drawer" to "Category: Settings Drawer"
-)
-
 @Composable
 fun ToolsScreen(viewModel: ToolsViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     var selectedMainTab by remember { mutableIntStateOf(0) } // 0: Viewer, 1: Data, 2: Render
 
-    // Modal Slot Capture Dialog Triggered on 2nd Pause
-    if (uiState.slotStep == 3) {
+    // Modal Slot Capture Dialog Triggered on 2nd Pause (Only in Normal slot cycle)
+    if (uiState.studioMode != "Cue" && uiState.slotStep == 3) {
         SlotCaptureDialog(viewModel = viewModel, state = uiState)
     }
 
@@ -225,26 +219,33 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                         state.extractedOcrData[currentFrame.index],
                         state.activeRules
                     ) {
-                        val boxes = mutableListOf<DetectedTargetBox>()
-                        boxes.addAll(state.directBlurs[currentFrame.index] ?: emptyList())
-
-                        state.extractedOcrData[currentFrame.index]?.let { ocr ->
-                            for (rule in state.activeRules) {
-                                if (!rule.isZipSource) {
-                                    val matched = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, rule.text)
-                                    for (b in matched) {
-                                        boxes.add(
-                                            DetectedTargetBox(
-                                                x0 = b.x0, y0 = b.y0, width = b.width, height = b.height,
-                                                text = rule.text, tool = rule.tool, frame = currentFrame.index,
-                                                time = currentFrame.timeSeconds
+                        val direct = state.directBlurs[currentFrame.index]
+                        if (!direct.isNullOrEmpty()) {
+                            direct
+                        } else {
+                            val boxes = mutableListOf<DetectedTargetBox>()
+                            state.extractedOcrData[currentFrame.index]?.let { ocr ->
+                                for (rule in state.activeRules) {
+                                    if (!rule.isZipSource) {
+                                        val matched = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, rule.text)
+                                        for (b in matched) {
+                                            if (rule.clusterCenter != null) {
+                                                val dist = hypot(b.centerX - rule.clusterCenter.x, b.centerY - rule.clusterCenter.y)
+                                                if (dist > rule.clusterCenter.threshold) continue
+                                            }
+                                            boxes.add(
+                                                DetectedTargetBox(
+                                                    x0 = b.x0, y0 = b.y0, width = b.width, height = b.height,
+                                                    text = rule.text, tool = rule.tool, frame = currentFrame.index,
+                                                    time = currentFrame.timeSeconds
+                                                )
                                             )
-                                        )
+                                        }
                                     }
                                 }
                             }
+                            boxes
                         }
-                        boxes
                     }
 
                     ToolsOverlayPreview(
@@ -262,7 +263,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
             }
 
             // Slot Cycle Banner
-            if (state.frames.isNotEmpty()) {
+            if (state.frames.isNotEmpty() && state.studioMode != "Cue") {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -621,27 +622,27 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(Color(0xFF090E1A))
                                 .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(8.dp))
-                                .padding(10.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
-                                    Text("IDM 10-Stream Parallel Extractor (100 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                }
-                                Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Icon(Icons.Default.Speed, contentDescription = "IDM Concurrent Engine", tint = AccentBlue, modifier = Modifier.size(16.dp))
+                                Text("IDM 10-Stream Parallel Extractor (100 Frames/Batch)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                             }
+                            Text("${state.progressPercent}%", color = SuccessGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
 
-                            // 10 Individual Worker Progress Bars in a Smooth Scrollable Column
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(max = 240.dp)
-                                    .verticalScroll(rememberScrollState()),
+                        // 10 Individual Worker Progress Bars in a Smooth Scrollable Column
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 240.dp)
+                                .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             state.workerTasks.forEach { task ->
@@ -745,7 +746,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         }
     }
 
-    // 4. TARGET PANEL & RULES CARD (CONTROL 3: TARGET WORD INPUT BOX)
+    // 4. TARGET PANEL & RULES CARD (CONTROL 3: TARGET WORD & DYNAMIC REGION SELECTION)
     Card(
         colors = CardDefaults.cardColors(containerColor = SurfaceDark),
         shape = RoundedCornerShape(10.dp),
@@ -753,12 +754,13 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
         modifier = Modifier.fillMaxWidth()
     ) {
         var keyword by remember { mutableStateOf("") }
-        var selectedCategory by remember { mutableStateOf("global_anywhere") }
-        var selectedTool by remember { mutableStateOf("blur_gaussian") }
-        var categoryExpanded by remember { mutableStateOf(false) }
+        var selectedCategory by remember { mutableStateOf("Global (Anywhere)") }
+        var selectedTool by remember { mutableStateOf("button_highlight") }
         var toolExpanded by remember { mutableStateOf(false) }
-        var clusterExpanded by remember { mutableStateOf(false) }
+        var locationExpanded by remember { mutableStateOf(false) }
         var selectedClusterId by remember { mutableStateOf("all") }
+
+        val clusters = state.detectedClusters
 
         Column(Modifier.padding(10.dp)) {
             OutlinedTextField(
@@ -767,7 +769,7 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
                     keyword = it 
                     viewModel.updateTargetClusters(it)
                 },
-                placeholder = { Text("Target word on screen (e.g. Playground, Dashboard, Email)") },
+                placeholder = { Text("Target word on screen (e.g. all models, playground)") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 colors = OutlinedTextFieldDefaults.colors(
@@ -779,55 +781,56 @@ private fun StudioViewerTab(viewModel: ToolsViewModel, state: ToolsUiState) {
             )
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Dynamic Auto-Cluster Dropdown (Tab 1)
-            if (state.detectedClusters.size > 1) {
-                Box(modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
-                    OutlinedButton(
-                        onClick = { clusterExpanded = true },
-                        shape = RoundedCornerShape(6.dp),
-                        modifier = Modifier.fillMaxWidth(),
-                        border = BorderStroke(1.dp, AccentBlue),
-                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF1E1B4B))
-                    ) {
-                        Text(
-                            text = if (selectedClusterId == "all") "🌐 All Locations (${state.detectedClusters.size} Found)" 
-                                   else state.detectedClusters.find { it.id.toString() == selectedClusterId }?.displayName ?: "Selected Location",
-                            color = AccentBlue, fontWeight = FontWeight.Bold, fontSize = 12.sp, maxLines = 1
-                        )
-                    }
-                    DropdownMenu(expanded = clusterExpanded, onDismissRequest = { clusterExpanded = false }) {
-                        DropdownMenuItem(
-                            text = { Text("🌐 All Locations (${state.detectedClusters.size} Found)") },
-                            onClick = { selectedClusterId = "all"; clusterExpanded = false }
-                        )
-                        state.detectedClusters.forEach { cl ->
-                            DropdownMenuItem(
-                                text = { Text(cl.displayName) },
-                                onClick = { selectedClusterId = cl.id.toString(); clusterExpanded = false }
-                            )
+            // DYNAMIC DETECTED SCREEN AREA / LOCATION DROPDOWN (100% Coordinate-Driven)
+            Box(modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { locationExpanded = true },
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    border = BorderStroke(1.dp, if (clusters.isNotEmpty()) AccentBlue else BorderColor),
+                    colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0xFF1E1B4B))
+                ) {
+                    val label = when {
+                        selectedClusterId != "all" -> {
+                            clusters.find { it.id.toString() == selectedClusterId }?.displayName ?: "Selected Location"
                         }
+                        clusters.isNotEmpty() -> {
+                            "🌐 All Locations (${clusters.size} Found)"
+                        }
+                        else -> {
+                            "📍 Screen Area: Auto-Detect (Everywhere)"
+                        }
+                    }
+                    Text(
+                        text = label,
+                        color = AccentBlue,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp,
+                        maxLines = 1
+                    )
+                }
+                DropdownMenu(expanded = locationExpanded, onDismissRequest = { locationExpanded = false }) {
+                    DropdownMenuItem(
+                        text = { Text("🌐 All Locations (Everywhere on Screen)") },
+                        onClick = {
+                            selectedClusterId = "all"
+                            selectedCategory = "Global (Anywhere)"
+                            locationExpanded = false
+                        }
+                    )
+                    clusters.forEach { cl ->
+                        DropdownMenuItem(
+                            text = { Text(cl.displayName) },
+                            onClick = {
+                                selectedClusterId = cl.id.toString()
+                                selectedCategory = cl.shortLabel
+                                locationExpanded = false
+                            }
+                        )
                     }
                 }
             }
 
-            // Category Selector
-            Box(modifier = Modifier.fillMaxWidth()) {
-                OutlinedButton(
-                    onClick = { categoryExpanded = true },
-                    shape = RoundedCornerShape(6.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(ALL_CATEGORIES.find { it.first == selectedCategory }?.second ?: "Category", color = Color.White, fontSize = 12.sp)
-                }
-                DropdownMenu(expanded = categoryExpanded, onDismissRequest = { categoryExpanded = false }) {
-                    ALL_CATEGORIES.forEach { (catId, catTitle) ->
-                        DropdownMenuItem(
-                            text = { Text(catTitle) },
-                            onClick = { selectedCategory = catId; categoryExpanded = false }
-                        )
-                    }
-                }
-            }
             Spacer(modifier = Modifier.height(6.dp))
 
             // Tool Selector & Lock Target Row
@@ -1559,7 +1562,7 @@ private fun TerminalConsole(viewModel: ToolsViewModel, state: ToolsUiState) {
 
 // =========================================================================
 // TAB 3: RENDER VIDEO WITH REAL-TIME PROGRESS BAR
-// =========================================================================
+// =========================================================
 @Composable
 private fun RenderVideoTab(viewModel: ToolsViewModel, state: ToolsUiState) {
     Card(
