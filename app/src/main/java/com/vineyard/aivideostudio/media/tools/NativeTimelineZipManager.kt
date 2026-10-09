@@ -1,5 +1,6 @@
 package com.vineyard.aivideostudio.media.tools
 
+import com.vineyard.aivideostudio.media.ocr.FrameOcrData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -39,7 +40,8 @@ data class ZipOcrFrame(
 data class ZipScanResult(
     val detectedBoxes: List<DetectedTargetBox>,
     val transcript: List<AudioCueSegment>,
-    val totalScannedFiles: Int
+    val totalScannedFiles: Int,
+    val ocrData: Map<Int, FrameOcrData> = emptyMap()
 )
 
 /**
@@ -58,7 +60,8 @@ object NativeTimelineZipManager {
 
     /**
      * Parses an incoming ZIP input stream in a single streaming pass on Dispatchers.IO.
-     * Extracts keyword matches for [targetQuery] and parses embedded transcripts if present.
+     * Extracts keyword matches for [targetQuery], preserves all full OCR frame data,
+     * and parses embedded transcripts if present.
      */
     suspend fun parseZip(
         zipInputStreamSource: InputStream,
@@ -68,6 +71,7 @@ object NativeTimelineZipManager {
         val detectedBoxes = mutableListOf<DetectedTargetBox>()
         var parsedTranscript = mutableListOf<AudioCueSegment>()
         var scannedFilesCount = 0
+        val ocrDataMap = mutableMapOf<Int, FrameOcrData>()
 
         val cleanTarget = SpatialClusterer.clean(targetQuery)
         val userPart = if (targetQuery.contains("@")) {
@@ -128,51 +132,68 @@ object NativeTimelineZipManager {
                 // Prioritize the frame index recorded inside the JSON payload
                 val frameIdx = ocrObj.optInt("frame", fallbackIdx)
                 val frameTime = ocrObj.optDouble("time", (frameIdx / 12.0)).toFloat()
+                
+                val parsedLinesForFrame = mutableListOf<OcrLineData>()
 
                 for (l in 0 until linesArray.length()) {
                     val lineObj = linesArray.getJSONObject(l)
                     val lineText = lineObj.optString("text", "")
                     val lineClean = SpatialClusterer.clean(lineText)
 
+                    val bboxObj = lineObj.optJSONObject("bbox")
+                    val lineBox = if (bboxObj != null) {
+                        val x0 = bboxObj.optDouble("x0", 0.0).toFloat()
+                        val y0 = bboxObj.optDouble("y0", 0.0).toFloat()
+                        val width = if (bboxObj.has("width")) bboxObj.optDouble("width", 100.0).toFloat()
+                                    else (bboxObj.optDouble("x1", (x0 + 100.0)) - x0).toFloat()
+                        val height = if (bboxObj.has("height")) bboxObj.optDouble("height", 30.0).toFloat()
+                                     else (bboxObj.optDouble("y1", (y0 + 30.0)) - y0).toFloat()
+                        ToolsBoundingBox(x0, y0, width, height)
+                    } else {
+                        ToolsBoundingBox(0f, 0f, 100f, 30f)
+                    }
+
+                    val wordsArray = lineObj.optJSONArray("words") ?: JSONArray()
+                    val parsedWordsList = mutableListOf<OcrWordData>()
+                    val matchedWordBoxes = mutableListOf<ToolsBoundingBox>()
+
+                    for (w in 0 until wordsArray.length()) {
+                        val wordObj = wordsArray.getJSONObject(w)
+                        val wordText = wordObj.optString("text", "")
+                        val wordClean = SpatialClusterer.clean(wordText)
+
+                        val wb = wordObj.optJSONObject("bbox")
+                        val wordBox = if (wb != null) {
+                            val wx0 = wb.optDouble("x0", 0.0).toFloat()
+                            val wy0 = wb.optDouble("y0", 0.0).toFloat()
+                            val ww = if (wb.has("width")) wb.optDouble("width", 50.0).toFloat()
+                                     else (wb.optDouble("x1", (wx0 + 50.0)) - wx0).toFloat()
+                            val wh = if (wb.has("height")) wb.optDouble("height", 25.0).toFloat()
+                                     else (wb.optDouble("y1", (wy0 + 25.0)) - wy0).toFloat()
+                            ToolsBoundingBox(wx0, wy0, ww, wh)
+                        } else {
+                            ToolsBoundingBox(0f, 0f, 50f, 25f)
+                        }
+
+                        parsedWordsList.add(OcrWordData(wordText, wordBox))
+
+                        if (cleanTarget.isEmpty() || wordClean.contains(cleanTarget) || (userPart.length >= 4 && wordClean.contains(userPart))) {
+                            matchedWordBoxes.add(wordBox)
+                        }
+                    }
+
+                    parsedLinesForFrame.add(
+                        OcrLineData(
+                            text = lineText,
+                            bbox = lineBox,
+                            words = parsedWordsList
+                        )
+                    )
+
                     val isMatch = cleanTarget.isEmpty() || lineClean.contains(cleanTarget) ||
                             (userPart.length >= 4 && lineClean.contains(userPart))
 
                     if (isMatch) {
-                        val bboxObj = lineObj.optJSONObject("bbox")
-                        val lineBox = if (bboxObj != null) {
-                            val x0 = bboxObj.optDouble("x0", 0.0).toFloat()
-                            val y0 = bboxObj.optDouble("y0", 0.0).toFloat()
-                            val width = if (bboxObj.has("width")) bboxObj.optDouble("width", 100.0).toFloat()
-                                        else (bboxObj.optDouble("x1", (x0 + 100.0)) - x0).toFloat()
-                            val height = if (bboxObj.has("height")) bboxObj.optDouble("height", 30.0).toFloat()
-                                         else (bboxObj.optDouble("y1", (y0 + 30.0)) - y0).toFloat()
-                            ToolsBoundingBox(x0, y0, width, height)
-                        } else {
-                            ToolsBoundingBox(0f, 0f, 100f, 30f)
-                        }
-
-                        val wordsArray = lineObj.optJSONArray("words") ?: JSONArray()
-                        val matchedWordBoxes = mutableListOf<ToolsBoundingBox>()
-
-                        for (w in 0 until wordsArray.length()) {
-                            val wordObj = wordsArray.getJSONObject(w)
-                            val wordText = wordObj.optString("text", "")
-                            val wordClean = SpatialClusterer.clean(wordText)
-
-                            if (cleanTarget.isEmpty() || wordClean.contains(cleanTarget) || (userPart.length >= 4 && wordClean.contains(userPart))) {
-                                val wb = wordObj.optJSONObject("bbox")
-                                if (wb != null) {
-                                    val wx0 = wb.optDouble("x0", 0.0).toFloat()
-                                    val wy0 = wb.optDouble("y0", 0.0).toFloat()
-                                    val ww = if (wb.has("width")) wb.optDouble("width", 50.0).toFloat()
-                                             else (wb.optDouble("x1", (wx0 + 50.0)) - wx0).toFloat()
-                                    val wh = if (wb.has("height")) wb.optDouble("height", 25.0).toFloat()
-                                             else (wb.optDouble("y1", (wy0 + 25.0)) - wy0).toFloat()
-                                    matchedWordBoxes.add(ToolsBoundingBox(wx0, wy0, ww, wh))
-                                }
-                            }
-                        }
-
                         if (matchedWordBoxes.isNotEmpty()) {
                             val minX = matchedWordBoxes.minOf { it.x0 }
                             val minY = matchedWordBoxes.minOf { it.y0 }
@@ -209,6 +230,14 @@ object NativeTimelineZipManager {
                         }
                     }
                 }
+
+                if (parsedLinesForFrame.isNotEmpty()) {
+                    ocrDataMap[frameIdx] = FrameOcrData(
+                        frameIndex = frameIdx,
+                        time = frameTime,
+                        lines = parsedLinesForFrame
+                    )
+                }
             } catch (_: Exception) {
                 // Skip malformed frame JSON without breaking batch parse
             }
@@ -217,7 +246,8 @@ object NativeTimelineZipManager {
         ZipScanResult(
             detectedBoxes = detectedBoxes,
             transcript = parsedTranscript,
-            totalScannedFiles = scannedFilesCount
+            totalScannedFiles = scannedFilesCount,
+            ocrData = ocrDataMap
         )
     }
 
