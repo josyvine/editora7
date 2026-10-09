@@ -41,6 +41,18 @@ fun AppNavGraph(
     val app = context.applicationContext as EditoraApplication
     val container = app.container
 
+    // Retained at the NavGraph level so that extracted frames, OCR data,
+    // and worker stream progress persist when navigating between bottom tabs.
+    val toolsViewModel = remember {
+        ToolsViewModel(
+            application = app,
+            geminiPreferences = container.geminiPreferences,
+            frameExtractor = container.fastNativeFrameExtractor,
+            ocrEngine = container.nativeBatchOcrEngine,
+            audioExtractor = container.audioExtractor
+        )
+    }
+
     Scaffold(
         bottomBar = {
             StudioBottomNavigationBar(navController = navController)
@@ -105,17 +117,8 @@ fun AppNavGraph(
                     )
                 }
 
-                // NEW: Tools Workstation Routing
+                // NEW: Tools Workstation Routing (Uses retained toolsViewModel)
                 composable(Screen.Tools.route) {
-                    val toolsViewModel = remember {
-                        ToolsViewModel(
-                            application = app,
-                            geminiPreferences = container.geminiPreferences,
-                            frameExtractor = container.fastNativeFrameExtractor,
-                            ocrEngine = container.nativeBatchOcrEngine,
-                            audioExtractor = container.audioExtractor
-                        )
-                    }
                     ToolsScreen(viewModel = toolsViewModel)
                 }
 
