@@ -35,6 +35,7 @@ import com.vineyard.aivideostudio.media.tools.SpatialClusterer
 import com.vineyard.aivideostudio.media.tools.TimeSlotSession
 import com.vineyard.aivideostudio.media.tools.ToolsBoundingBox
 import com.vineyard.aivideostudio.media.tools.ZipOcrFrame
+import com.vineyard.aivideostudio.media.tools.ZipScanResult
 import com.vineyard.aivideostudio.media.video.ExtractedFrame
 import com.vineyard.aivideostudio.media.video.FastNativeFrameExtractor
 import com.vineyard.aivideostudio.processing.worker.VideoProcessingForegroundService
@@ -827,16 +828,38 @@ class ToolsViewModel(
             _uiState.update { it.copy(statusText = "Locking Target Mask...", statusColorHex = "#eab308") }
             
             viewModelScope.launch(Dispatchers.Default) {
-                // Pass 1: Initial scan to find the exact target coordinates on the anchor frame
-                val firstFrame = state.frames.first()
-                val anchorOcr = ocrEngine.scanFrame(firstFrame, roiMask = null)
-                val targetMatches = SpatialClusterer.findMatchingBoundingBoxes(anchorOcr.lines, keyword)
-                
-                val bestBox: ToolsBoundingBox? = if (clusterCenter != null) {
-                    targetMatches.find { hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold }
-                        ?: targetMatches.firstOrNull()
-                } else {
-                    targetMatches.firstOrNull()
+                // Pass 1: Dynamically find the anchor frame and exact bounding box for the chosen cluster
+                var anchorFrame: ExtractedFrame? = null
+                var bestBox: ToolsBoundingBox? = null
+
+                if (clusterCenter != null) {
+                    for (frame in state.frames) {
+                        val ocr = state.extractedOcrData[frame.index]
+                        if (ocr != null) {
+                            val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, keyword)
+                            val matchInCluster = matches.find { 
+                                hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold 
+                            }
+                            if (matchInCluster != null) {
+                                anchorFrame = frame
+                                bestBox = matchInCluster
+                                break
+                            }
+                        }
+                    }
+                }
+
+                if (bestBox == null) {
+                    val fallbackFrame = state.frames.getOrNull(state.currentFrameIndex) ?: state.frames.first()
+                    anchorFrame = fallbackFrame
+                    val anchorOcr = state.extractedOcrData[fallbackFrame.index] ?: ocrEngine.scanFrame(fallbackFrame, roiMask = null)
+                    val targetMatches = SpatialClusterer.findMatchingBoundingBoxes(anchorOcr.lines, keyword)
+                    bestBox = if (clusterCenter != null) {
+                        targetMatches.find { hypot(it.centerX - clusterCenter.x, it.centerY - clusterCenter.y) <= clusterCenter.threshold }
+                            ?: targetMatches.firstOrNull()
+                    } else {
+                        targetMatches.firstOrNull()
+                    }
                 }
 
                 // Pass 2: Programmatic Blackout Mask (Zero Drag)
@@ -854,8 +877,24 @@ class ToolsViewModel(
 
                 // Run batch scan with automated ROI mask in memory
                 val batchResults = ocrEngine.scanBatch(state.frames, roiMask = autoRoiMask, parallelWorkers = 5) { _, _ -> }
+                
+                // Merge masked results into master OCR map without destroying lines outside the mask
                 val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
-                updatedOcr.putAll(batchResults)
+                for ((fIdx, batchOcr) in batchResults) {
+                    val existing = updatedOcr[fIdx]
+                    if (existing != null) {
+                        val outsideLines = existing.lines.filter { line ->
+                            autoRoiMask == null || 
+                            (line.bbox.x0 + line.bbox.width < autoRoiMask.x0 ||
+                             line.bbox.x0 > autoRoiMask.x0 + autoRoiMask.width ||
+                             line.bbox.y0 + line.bbox.height < autoRoiMask.y0 ||
+                             line.bbox.y0 > autoRoiMask.y0 + autoRoiMask.height)
+                        }
+                        updatedOcr[fIdx] = existing.copy(lines = outsideLines + batchOcr.lines)
+                    } else {
+                        updatedOcr[fIdx] = batchOcr
+                    }
+                }
 
                 withContext(Dispatchers.Main) {
                     _uiState.update { it.copy(extractedOcrData = updatedOcr) }
@@ -1339,8 +1378,8 @@ class ToolsViewModel(
         }
     }
 
-    private suspend fun processZipResult(result: com.vineyard.aivideostudio.media.tools.ZipScanResult, targetQuery: String, selectedTool: String) {
-        if (result.detectedBoxes.isEmpty()) {
+    private suspend fun processZipResult(result: ZipScanResult, targetQuery: String, selectedTool: String) {
+        if (result.detectedBoxes.isEmpty() && result.ocrData.isEmpty()) {
             withContext(Dispatchers.Main) {
                 addLog("⚠️ Target '$targetQuery' was not found in any frame of this ZIP.", LogType.WARNING)
                 _uiState.update { it.copy(isProcessing = false, statusText = "Target Not Found", statusColorHex = "#ef4444") }
@@ -1350,16 +1389,42 @@ class ToolsViewModel(
 
         val refW = _uiState.value.videoWidth
         val refH = _uiState.value.videoHeight
-        val clusters = SpatialClusterer.clusterBoxes(result.detectedBoxes, refW, refH)
-        val timeSlots = SpatialClusterer.segmentTimeSlots(result.detectedBoxes, _uiState.value.targetFps)
+        
+        val boxesToUse = if (result.detectedBoxes.isNotEmpty()) {
+            result.detectedBoxes
+        } else {
+            val autoBoxes = mutableListOf<DetectedTargetBox>()
+            for ((frameIdx, ocr) in result.ocrData) {
+                val matches = SpatialClusterer.findMatchingBoundingBoxes(ocr.lines, targetQuery)
+                for (b in matches) {
+                    autoBoxes.add(
+                        DetectedTargetBox(
+                            x0 = b.x0, y0 = b.y0, width = b.width, height = b.height,
+                            text = targetQuery, tool = selectedTool, frame = frameIdx,
+                            time = ocr.time
+                        )
+                    )
+                }
+            }
+            autoBoxes
+        }
+
+        val clusters = SpatialClusterer.clusterBoxes(boxesToUse, refW, refH)
+        val timeSlots = SpatialClusterer.segmentTimeSlots(boxesToUse, _uiState.value.targetFps)
+
+        val updatedOcr = _uiState.value.extractedOcrData.toMutableMap()
+        if (result.ocrData.isNotEmpty()) {
+            updatedOcr.putAll(result.ocrData)
+        }
 
         withContext(Dispatchers.Main) {
             _uiState.update { it.copy(
                 activeZipTarget = targetQuery,
                 activeZipTool = selectedTool,
-                rawDetectedZipBoxes = result.detectedBoxes,
+                rawDetectedZipBoxes = boxesToUse,
                 detectedZipClusters = clusters,
                 detectedZipTimeSlots = timeSlots,
+                extractedOcrData = if (result.ocrData.isNotEmpty()) updatedOcr else it.extractedOcrData,
                 transcriptCues = if (result.transcript.isNotEmpty()) result.transcript else it.transcriptCues,
                 isProcessing = false
             )}
@@ -1367,7 +1432,7 @@ class ToolsViewModel(
                 filterAudioCues("")
             }
             reapplyZipFilters()
-            addLog("🎉 Processed ZIP: Found ${result.detectedBoxes.size} boxes across ${clusters.size} clusters and ${timeSlots.size} slots.", LogType.SUCCESS)
+            addLog("🎉 Processed ZIP: Loaded ${result.ocrData.size} OCR frames, found ${boxesToUse.size} matching boxes across ${clusters.size} clusters and ${timeSlots.size} slots.", LogType.SUCCESS)
         }
     }
 
